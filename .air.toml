@@ -1,0 +1,10 @@
+root = "."
+tmp_dir = "tmp"
+
+[build]
+  cmd = "make backend"
+  bin = "./build/zvkr"
+  args_bin = ["-no-browser"]
+  include_dir = ["cmd", "internal"]
+  exclude_dir = ["internal/routes/dist"]
+  include_ext = ["go"]
