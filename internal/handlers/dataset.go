@@ -66,7 +66,7 @@ var (
 )
 
 const (
-	maxCodeLenBytes    = 60_000
+	maxCodeLenBytes    = 18_000
 	maxRetriesCode     = 3
 	maxLastErrorLen    = 1200
 	llmAttemptTimeout  = 45 * time.Second
@@ -84,32 +84,41 @@ func truncateError(s string) string {
 
 func validateGeneratedCode(code string, maxLen int) string {
 	code = strings.TrimSpace(code)
+
 	if code == "" {
 		return "Empty code from LLM"
 	}
+
 	if len(code) > maxLen {
 		return fmt.Sprintf("Generated code too large: %d bytes (limit: %d)", len(code), maxLen)
 	}
+
 	if reForbiddenImp.MatchString(code) {
 		return "Forbidden import detected (pandas/numpy/matplotlib/seaborn/plotly)"
 	}
+
 	if reDatasetAssign.MatchString(code) {
 		return "Code defines hardcoded container variable (dataset/data/rows/records)"
 	}
+
 	if strings.Contains(code, "open(") {
 		return "Forbidden function detected: open()"
 	}
+
 	if !strings.Contains(code, "print(") {
 		return "Code does not print result JSON"
 	}
+
 	return ""
 }
 
 func validateExecutionContract(output string, totalRows int) string {
 	trimmed := strings.TrimSpace(output)
+
 	if trimmed == "" {
 		return "Empty output"
 	}
+
 	if !strings.HasPrefix(trimmed, "{") {
 		return "Output is not JSON object"
 	}
@@ -123,13 +132,16 @@ func validateExecutionContract(output string, totalRows int) string {
 		return fmt.Sprintf("meta.total_rows_expected mismatch: got %d, want %d",
 			payload.Meta.TotalRowsExpected, totalRows)
 	}
+
 	if payload.Meta.ScannedRows != totalRows {
 		return fmt.Sprintf("meta.scanned_rows mismatch: got %d, want %d",
 			payload.Meta.ScannedRows, totalRows)
 	}
+
 	if payload.Meta.UsedRows < 0 || payload.Meta.UsedRows > totalRows {
 		return fmt.Sprintf("meta.used_rows invalid: %d", payload.Meta.UsedRows)
 	}
+
 	if payload.Summary == nil {
 		return "summary is required"
 	}
@@ -158,11 +170,13 @@ assert len(dataset) == _expected_len, (
 
 func (h *DatasetHandler) GetChatHistory(c *fiber.Ctx) error {
 	id, _ := strconv.Atoi(c.Params("id"))
+
 	var messages []models.ChatMessage
 
 	if err := h.DB.Where("dataset_id = ?", id).Order("created_at asc").Find(&messages).Error; err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": "Failed to load history"})
 	}
+
 	return c.JSON(messages)
 }
 
@@ -172,6 +186,7 @@ func (h *DatasetHandler) GetChatHistory(c *fiber.Ctx) error {
 
 func (h *DatasetHandler) Upload(c *fiber.Ctx) error {
 	start := time.Now()
+
 	file, err := c.FormFile("file")
 	if err != nil {
 		return c.Status(400).JSON(fiber.Map{"error": "File required"})
@@ -209,6 +224,7 @@ func (h *DatasetHandler) Upload(c *fiber.Ctx) error {
 	}
 
 	log.Printf("[Upload] Success. Rows: %d. Time: %v", len(data), time.Since(start))
+
 	return c.JSON(fiber.Map{
 		"id":         dataset.ID,
 		"rows_count": len(data),
@@ -218,18 +234,22 @@ func (h *DatasetHandler) Upload(c *fiber.Ctx) error {
 
 func (h *DatasetHandler) ListDatasets(c *fiber.Ctx) error {
 	var datasets []models.Dataset
+
 	if err := h.DB.Select("id", "name", "source", "created_at", "updated_at").Order("created_at desc").Find(&datasets).Error; err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": "Failed to fetch datasets"})
 	}
+
 	return c.JSON(datasets)
 }
 
 func (h *DatasetHandler) GetDataset(c *fiber.Ctx) error {
 	id, _ := strconv.Atoi(c.Params("id"))
+
 	var dataset models.Dataset
 	if err := h.DB.First(&dataset, id).Error; err != nil {
 		return c.Status(404).JSON(fiber.Map{"error": "Dataset not found"})
 	}
+
 	return c.JSON(dataset)
 }
 
@@ -237,13 +257,16 @@ func (h *DatasetHandler) RunPython(c *fiber.Ctx) error {
 	var req struct {
 		Code string `json:"code"`
 	}
+
 	if err := c.BodyParser(&req); err != nil {
 		return c.Status(400).SendString("Invalid JSON")
 	}
+
 	res, err := h.Sandbox.Execute(c.Context(), req.Code, []map[string]interface{}{})
 	if err != nil {
 		return c.JSON(fiber.Map{"status": "error", "error": err.Error()})
 	}
+
 	return c.JSON(fiber.Map{"status": "success", "result": res})
 }
 
@@ -253,24 +276,29 @@ func (h *DatasetHandler) RunPython(c *fiber.Ctx) error {
 
 func (h *DatasetHandler) Chat(c *fiber.Ctx) error {
 	id, _ := strconv.Atoi(c.Params("id"))
+
 	var req struct {
 		Message string `json:"message"`
 		UseCode bool   `json:"use_code"`
 		UseNews bool   `json:"use_news"`
 	}
+
 	if err := c.BodyParser(&req); err != nil {
 		return c.Status(400).SendString("Invalid body")
+	}
+
+	originalMessage := strings.TrimSpace(req.Message)
+	if originalMessage == "" {
+		return c.Status(400).JSON(fiber.Map{"error": "Message is required"})
 	}
 
 	userMsg := models.ChatMessage{
 		DatasetID: uint(id),
 		Role:      "user",
-		Content:   req.Message,
+		Content:   originalMessage,
 		CreatedAt: time.Now(),
 	}
 	h.DB.Create(&userMsg)
-
-	req.Message += ". БЕЗ ДУБЛИКТОВ СТУДЕНТОВ"
 
 	var dataset models.Dataset
 	if err := h.DB.First(&dataset, id).Error; err != nil {
@@ -280,6 +308,14 @@ func (h *DatasetHandler) Chat(c *fiber.Ctx) error {
 	var dataObj []map[string]interface{}
 	if err := json.Unmarshal(dataset.Data, &dataObj); err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": "Data corrupt"})
+	}
+
+	req.Message = originalMessage
+
+	// Для обычных датасетов студентов сохраняем старую подсказку.
+	// Для агрегированных отчётов это вредно: там нет студентов построчно.
+	if !looksLikeAggregateReport(dataObj) {
+		req.Message += ". БЕЗ ДУБЛИКТОВ СТУДЕНТОВ"
 	}
 
 	log.Printf("[Chat] ID: %d | Rows: %d | CodeMode: %v | NewsMode: %v",
@@ -294,8 +330,10 @@ func (h *DatasetHandler) Chat(c *fiber.Ctx) error {
 	}
 
 	enrichedQuery := req.Message
+
 	if req.UseNews && h.BoltDB != nil {
 		var newsData []byte
+
 		h.BoltDB.View(func(tx *bbolt.Tx) error {
 			b := tx.Bucket([]byte("DashboardCache"))
 			if b != nil {
@@ -303,6 +341,7 @@ func (h *DatasetHandler) Chat(c *fiber.Ctx) error {
 			}
 			return nil
 		})
+
 		if len(newsData) > 0 {
 			enrichedQuery = fmt.Sprintf(
 				"%s\n\nВАЖНЫЙ КОНТЕКСТ ДЛЯ АНАЛИЗА (Последние новости/законы):\n%s",
@@ -313,6 +352,52 @@ func (h *DatasetHandler) Chat(c *fiber.Ctx) error {
 	}
 
 	return h.handleTextAnalysisSmart(c, enrichedQuery, dataObj, id)
+}
+
+// ---------------------------------------------------------------------
+// AGGREGATE REPORT DETECTION FOR CHAT PROMPTING
+// ---------------------------------------------------------------------
+
+func looksLikeAggregateReport(data []map[string]interface{}) bool {
+	for _, row := range data {
+		for key := range row {
+			k := normalizeHeaderForChat(key)
+
+			if k == "контингент обучающихся" ||
+				k == "отчислено всего (чел.)" ||
+				k == "отчислены за неуспеваемость (чел.)" ||
+				k == "отчислены за неоплату обучения (чел.)" ||
+				k == "отчислены за не оплату обучения (чел.)" ||
+				k == "отчислены по собственному желанию (чел.)" ||
+				k == "выпуск (получили образование)(чел.)" ||
+				k == "восстановлены (чел.)" ||
+				k == "зачислены переводом из другого вуза/филиала (чел.)" ||
+				k == "переведены в другой вуз/филиал (чел.)" {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func normalizeHeaderForChat(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.ReplaceAll(s, "\u00a0", " ")
+	s = strings.ReplaceAll(s, "\r", " ")
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.ToLower(s)
+	s = strings.ReplaceAll(s, "ё", "е")
+	s = strings.Join(strings.Fields(s), " ")
+
+	s = strings.ReplaceAll(s, " /", "/")
+	s = strings.ReplaceAll(s, "/ ", "/")
+
+	s = strings.ReplaceAll(s, "реализвции", "реализации")
+	s = strings.ReplaceAll(s, "другогой", "другой")
+	s = strings.ReplaceAll(s, "не оплату", "неоплату")
+
+	return strings.TrimSpace(s)
 }
 
 // ---------------------------------------------------------------------
@@ -349,7 +434,13 @@ func (h *DatasetHandler) handleCodeAnalysis(c *fiber.Ctx, query string, data []m
 		if code == "" {
 			code = llmResp
 		}
+
 		code = sanitizeCode(code)
+
+		// Важно: сохраняем код ДО выполнения.
+		// Если sandbox упадёт, failed_code больше не будет пустым.
+		workingCode = code
+		log.Printf("[Code-Step] Generated code:\n%s", code)
 
 		if reason := validateGeneratedCode(code, maxCodeLenBytes); reason != "" {
 			lastError = truncateError(reason)
@@ -380,12 +471,12 @@ func (h *DatasetHandler) handleCodeAnalysis(c *fiber.Ctx, query string, data []m
 
 		log.Printf("[Code-Step] Success in %v", time.Since(execStart))
 		executionResultJSON = execResult
-		workingCode = code // Сохраняем без guard — для отображения пользователю
 		break
 	}
 
 	if executionResultJSON == "" {
 		msg := fmt.Sprintf("Failed after %d attempts. Last error: %s", maxRetriesCode, lastError)
+
 		h.DB.Create(&models.ChatMessage{
 			DatasetID:  uint(id),
 			Role:       "bot",
@@ -394,6 +485,7 @@ func (h *DatasetHandler) handleCodeAnalysis(c *fiber.Ctx, query string, data []m
 			IsError:    true,
 			CreatedAt:  time.Now(),
 		})
+
 		return c.Status(500).JSON(fiber.Map{
 			"error":       "Failed to analyze data after retries",
 			"last_error":  lastError,
@@ -402,6 +494,7 @@ func (h *DatasetHandler) handleCodeAnalysis(c *fiber.Ctx, query string, data []m
 	}
 
 	log.Println("[Report-Step] Generating text report...")
+
 	repCtx, cancelRep := context.WithTimeout(c.Context(), reportTimeout)
 	finalReport, repErr := h.generateAnalyticalReport(repCtx, query, executionResultJSON, len(data))
 	cancelRep()
@@ -507,8 +600,11 @@ func (h *DatasetHandler) handleTextAnalysisSmart(c *fiber.Ctx, query string, dat
 	finalAnswer, err := h.LLM.AnalyzeData(c.Context(), finalPrompt, nil)
 	if err != nil {
 		h.DB.Create(&models.ChatMessage{
-			DatasetID: uint(id), Role: "bot",
-			Content: err.Error(), IsError: true, CreatedAt: time.Now(),
+			DatasetID: uint(id),
+			Role:      "bot",
+			Content:   err.Error(),
+			IsError:   true,
+			CreatedAt: time.Now(),
 		})
 		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
 	}
@@ -538,15 +634,20 @@ func sanitizeCode(code string) string {
 	code = strings.ReplaceAll(code, "import pandas", "# import pandas")
 	code = strings.ReplaceAll(code, "import numpy", "# import numpy")
 	code = strings.ReplaceAll(code, "from pandas", "# from pandas")
+	code = strings.ReplaceAll(code, "from numpy", "# from numpy")
+
 	code = strings.ReplaceAll(code, "import matplotlib", "# import matplotlib")
 	code = strings.ReplaceAll(code, "from matplotlib", "# from matplotlib")
+
 	code = strings.ReplaceAll(code, "import seaborn", "# import seaborn")
 	code = strings.ReplaceAll(code, "from seaborn", "# from seaborn")
+
 	code = strings.ReplaceAll(code, "import plotly", "# import plotly")
 	code = strings.ReplaceAll(code, "from plotly", "# from plotly")
 
 	lines := strings.Split(code, "\n")
 	var cleanLines []string
+
 	inMultilineAssign := false
 	bracketDepth := 0
 
@@ -571,7 +672,6 @@ func sanitizeCode(code string) string {
 
 			cleanLines = append(cleanLines, "# "+line+" # REMOVED HARDCODED DATA")
 
-			// Проверяем, закрылось ли на этой же строке
 			bracketDepth = strings.Count(trimmed, "[") + strings.Count(trimmed, "{") + strings.Count(trimmed, "(")
 			bracketDepth -= strings.Count(trimmed, "]") + strings.Count(trimmed, "}") + strings.Count(trimmed, ")")
 			if bracketDepth > 0 {
@@ -584,6 +684,7 @@ func sanitizeCode(code string) string {
 
 		cleanLines = append(cleanLines, line)
 	}
+
 	return strings.Join(cleanLines, "\n")
 }
 
@@ -634,6 +735,7 @@ func buildSchemaHint(sample []map[string]interface{}) string {
 
 		lines = append(lines, fmt.Sprintf("  %q: <%s> e.g. %q", k, typeHint, exampleHint))
 	}
+
 	return "{\n" + strings.Join(lines, ",\n") + "\n}"
 }
 
@@ -658,11 +760,13 @@ STRICT RULES:
 3) Use only: json, math, statistics, datetime, collections.
 4) All values may be strings — always use try/except for int()/float() conversions.
 5) Output MUST be valid JSON via print(json.dumps(..., ensure_ascii=False)).
-6) Keep code under 300 lines. No long comments.
+6) Keep code under 160 lines. No long comments. Prefer simple loops.
 7) DO NOT hardcode example values. Iterate over ALL rows in dataset.
 8) DO NOT generate image files. DO NOT use plotting libraries.
 9) If user asks for a chart/graph/diagram, return chart data inside results["charts"].
 10) Charts must be JSON specs only. Frontend will render them.
+11) For aggregated reports, DO NOT deduplicate students. These rows are already aggregated.
+12) For aggregated reports, group by requested text columns and sum requested numeric columns.
 
 DATA SCHEMA (example format only — DO NOT copy values):
 - total rows: %d
@@ -771,6 +875,7 @@ func (h *DatasetHandler) generateAnalyticalReport(ctx context.Context, userQuery
 2. Не упоминай код/скрипт. Пиши «Анализ данных показал…».
 3. Если в charts есть данные, опиши графики.
 `, totalRows, pythonOutputJSON, userQuery)
+
 	return h.LLM.AnalyzeData(ctx, prompt, nil)
 }
 
@@ -778,10 +883,12 @@ func detectExecutionError(sysErr error, output string) string {
 	if sysErr != nil {
 		return fmt.Sprintf("System Error: %v", sysErr)
 	}
+
 	trimmed := strings.TrimSpace(output)
 	if trimmed == "" {
 		return "Empty output. Did you forget print(json.dumps(...))?"
 	}
+
 	lower := strings.ToLower(trimmed)
 	if strings.Contains(lower, "traceback") || strings.Contains(lower, "error:") {
 		if len(trimmed) > 400 {
@@ -789,17 +896,21 @@ func detectExecutionError(sysErr error, output string) string {
 		}
 		return "Script Error: " + trimmed
 	}
+
 	if !strings.HasPrefix(trimmed, "{") {
 		return "Output is not valid JSON. Must start with '{'"
 	}
+
 	return ""
 }
 
 func extractCode(text string) string {
 	re := regexp.MustCompile("(?s)```(?:python)?(.*?)```")
 	matches := re.FindStringSubmatch(text)
+
 	if len(matches) > 1 {
 		return strings.TrimSpace(matches[1])
 	}
+
 	return strings.TrimSpace(text)
 }
