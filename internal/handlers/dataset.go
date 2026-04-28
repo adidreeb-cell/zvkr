@@ -284,15 +284,17 @@ func (h *DatasetHandler) Chat(c *fiber.Ctx) error {
 		return c.Status(400).SendString("Invalid body")
 	}
 
+	originalMessage := strings.TrimSpace(req.Message)
+
 	userMsg := models.ChatMessage{
 		DatasetID: uint(id),
 		Role:      "user",
-		Content:   req.Message,
+		Content:   originalMessage,
 		CreatedAt: time.Now(),
 	}
 	h.DB.Create(&userMsg)
 
-	req.Message += ". БЕЗ ДУБЛИКТОВ СТУДЕНТОВ"
+	req.Message = originalMessage + ". БЕЗ ДУБЛИКТОВ СТУДЕНТОВ"
 
 	var dataset models.Dataset
 	if err := h.DB.First(&dataset, id).Error; err != nil {
@@ -311,10 +313,15 @@ func (h *DatasetHandler) Chat(c *fiber.Ctx) error {
 	// ухудшают качество кодогенерации.
 	//
 	// Но агрегированные Excel-отчёты для дашборда не отправляем в Python-песочницу:
-	// для них графики строятся напрямую из таблицы.
+	// - если пользователь просит график, строим chart JSON напрямую;
+	// - если пользователь задаёт обычный вопрос, отвечаем через LLM по рассчитанной сводке.
 	if req.UseCode {
 		if dashboardKind := detectDashboardDatasetKind(dataObj); dashboardKind != dashboardDatasetUnknown {
-			return h.handleDashboardAggregateAnalysis(c, req.Message, dataObj, id, dashboardKind)
+			if isChartRequest(originalMessage) {
+				return h.handleDashboardAggregateAnalysis(c, originalMessage, dataObj, id, dashboardKind)
+			}
+
+			return h.handleDashboardAggregateTextAnalysis(c, originalMessage, dataObj, id, dashboardKind)
 		}
 
 		return h.handleCodeAnalysis(c, req.Message, dataObj, id)
@@ -385,6 +392,96 @@ func detectDashboardDatasetKind(data []map[string]interface{}) string {
 	}
 
 	return dashboardDatasetUnknown
+}
+
+func isChartRequest(message string) bool {
+	msg := strings.ToLower(strings.TrimSpace(message))
+
+	keywords := []string{
+		"график",
+		"диаграмм",
+		"визуализ",
+		"chart",
+		"plot",
+		"bar",
+		"line",
+		"pie",
+		"столбц",
+		"кругов",
+		"линейн",
+		"построй",
+		"нарисуй",
+		"покажи динамику",
+	}
+
+	for _, keyword := range keywords {
+		if strings.Contains(msg, keyword) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (h *DatasetHandler) handleDashboardAggregateTextAnalysis(
+	c *fiber.Ctx,
+	query string,
+	data []map[string]interface{},
+	id int,
+	kind string,
+) error {
+	summaryData := buildDashboardAggregateSummary(data, kind)
+
+	prompt := fmt.Sprintf(`Ты аналитик данных образовательной организации.
+
+Пользователь спрашивает:
+%s
+
+Тип агрегированного отчёта:
+%s
+
+Данные уже агрегированы, это НЕ список студентов.
+Используй только эти рассчитанные значения:
+%s
+
+Ответь по запросу пользователя на русском языке.
+Если пользователь просит число — дай число.
+Если просит вывод — дай краткий аналитический вывод.
+Если данных недостаточно — прямо скажи, каких колонок не хватает.
+Не придумывай ФИО, ID студентов, средний балл или статусы, которых нет в отчёте.`,
+		query,
+		kind,
+		toPrettyJSON(summaryData),
+	)
+
+	answer, err := h.LLM.AnalyzeData(c.Context(), prompt, nil)
+	if err != nil {
+		h.DB.Create(&models.ChatMessage{
+			DatasetID: uint(id),
+			Role:      "bot",
+			Content:   err.Error(),
+			IsError:   true,
+			CreatedAt: time.Now(),
+		})
+
+		return c.Status(500).JSON(fiber.Map{
+			"error": err.Error(),
+		})
+	}
+
+	h.DB.Create(&models.ChatMessage{
+		DatasetID: uint(id),
+		Role:      "bot",
+		Content:   answer,
+		IsError:   false,
+		CreatedAt: time.Now(),
+	})
+
+	return c.JSON(fiber.Map{
+		"reply":      answer,
+		"dataset_id": id,
+		"mode":       "dashboard_aggregate_text",
+	})
 }
 
 func (h *DatasetHandler) handleDashboardAggregateAnalysis(
@@ -485,6 +582,56 @@ func (h *DatasetHandler) handleDashboardAggregateAnalysis(
 		"dataset_id":  id,
 		"mode":        "dashboard_aggregate_chart",
 	})
+}
+
+func buildDashboardAggregateSummary(data []map[string]interface{}, kind string) map[string]interface{} {
+	chartData := buildDashboardChartData(data, kind)
+
+	result := map[string]interface{}{
+		"report_type": kind,
+		"rows_total":  len(data),
+		"rows_used":   len(chartData),
+		"totals":      map[string]float64{},
+		"top":         []map[string]interface{}{},
+	}
+
+	totals := make(map[string]float64)
+
+	for _, row := range chartData {
+		for key, value := range row {
+			if key == "name" {
+				continue
+			}
+
+			switch v := value.(type) {
+			case float64:
+				totals[key] += v
+			case int:
+				totals[key] += float64(v)
+			case int64:
+				totals[key] += float64(v)
+			case int32:
+				totals[key] += float64(v)
+			}
+		}
+	}
+
+	result["totals"] = totals
+
+	sort.Slice(chartData, func(i, j int) bool {
+		return maxDashboardPointValue(chartData[i]) > maxDashboardPointValue(chartData[j])
+	})
+
+	topLimit := 10
+	if len(chartData) < topLimit {
+		topLimit = len(chartData)
+	}
+
+	if topLimit > 0 {
+		result["top"] = chartData[:topLimit]
+	}
+
+	return result
 }
 
 func buildDashboardChartData(data []map[string]interface{}, kind string) []map[string]interface{} {
@@ -754,6 +901,15 @@ func collectDashboardYKeys(data []map[string]interface{}) []string {
 	return keys
 }
 
+func toPrettyJSON(v interface{}) string {
+	b, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return fmt.Sprintf("%v", v)
+	}
+
+	return string(b)
+}
+
 // ---------------------------------------------------------------------
 // STRATEGY 1: PYTHON CODE INTERPRETER
 // ---------------------------------------------------------------------
@@ -798,8 +954,6 @@ func (h *DatasetHandler) handleCodeAnalysis(c *fiber.Ctx, query string, data []m
 			continue
 		}
 
-		// Инжектируем guard перед пользовательским кодом.
-		// Guard проверяет, что dataset не был переопределён внутри скрипта.
 		guardedCode := buildSandboxGuard(len(data)) + "\n" + code
 
 		execStart := time.Now()
@@ -823,7 +977,7 @@ func (h *DatasetHandler) handleCodeAnalysis(c *fiber.Ctx, query string, data []m
 		log.Printf("[Code-Step] Success in %v", time.Since(execStart))
 
 		executionResultJSON = execResult
-		workingCode = code // Сохраняем без guard — для отображения пользователю
+		workingCode = code
 		break
 	}
 
@@ -993,10 +1147,7 @@ func (h *DatasetHandler) handleTextAnalysisSmart(c *fiber.Ctx, query string, dat
 // UTILS & PROMPTS
 // ---------------------------------------------------------------------
 
-// sanitizeCode — первый проход: комментирует очевидные нарушения.
-// Не является единственной защитой — validateGeneratedCode проверяет строже.
 func sanitizeCode(code string) string {
-	// Убираем запрещённые импорты
 	code = strings.ReplaceAll(code, "import pandas", "# import pandas")
 	code = strings.ReplaceAll(code, "import numpy", "# import numpy")
 	code = strings.ReplaceAll(code, "from pandas", "# from pandas")
@@ -1011,7 +1162,6 @@ func sanitizeCode(code string) string {
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
 
-		// Обработка многострочного присваивания
 		if inMultilineAssign {
 			cleanLines = append(cleanLines, "# "+line+" # REMOVED")
 
@@ -1026,13 +1176,11 @@ func sanitizeCode(code string) string {
 			continue
 		}
 
-		// Однострочное/начало многострочного: dataset =, data =, rows =, records =
 		if reHardcodedAssign.MatchString(trimmed) &&
 			(strings.Contains(trimmed, "[") || strings.Contains(trimmed, "{") || strings.Contains(trimmed, "(")) {
 
 			cleanLines = append(cleanLines, "# "+line+" # REMOVED HARDCODED DATA")
 
-			// Проверяем, закрылось ли на этой же строке
 			bracketDepth = strings.Count(trimmed, "[") + strings.Count(trimmed, "{") + strings.Count(trimmed, "(")
 			bracketDepth -= strings.Count(trimmed, "]") + strings.Count(trimmed, "}") + strings.Count(trimmed, ")")
 
@@ -1051,9 +1199,6 @@ func sanitizeCode(code string) string {
 	return strings.Join(cleanLines, "\n")
 }
 
-// buildSchemaHint показывает тип + укороченный пример значения для каждого ключа.
-// LLM получает формат данных (нужен для парсинга дат/чисел), но не может
-// скопировать полную строку.
 func buildSchemaHint(sample []map[string]interface{}) string {
 	if len(sample) == 0 {
 		return "{}"
