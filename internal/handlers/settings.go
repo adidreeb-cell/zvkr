@@ -80,8 +80,14 @@ func (h *SettingsHandler) UpdateSettings(c *fiber.Ctx) error {
 	settings.UnivDBType = req.UnivDBType
 	settings.UnivDBDSN = req.UnivDBDSN
 
-	settings.EnableEmulator = req.EnableEmulator
+	settings.NewsCron = req.NewsCron
+	settings.MoodleCron = req.MoodleCron
 	settings.EmulatorCron = req.EmulatorCron
+	settings.AnalyticsCron = req.AnalyticsCron
+	settings.IMAPCron = req.IMAPCron
+	settings.ERPCron = req.ERPCron
+
+	settings.EnableEmulator = req.EnableEmulator
 	settings.UpdatedAt = time.Now()
 
 	// 2. Обновляем секретные поля (только если они изменены и это не маска)

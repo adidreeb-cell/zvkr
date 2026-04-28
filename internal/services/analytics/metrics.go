@@ -80,6 +80,7 @@ type ColumnMapping struct {
 
 func (s *Service) ProcessUnprocessedDatasets(ctx context.Context) error {
 	var datasets []models.Dataset
+
 	// Важно: стабильный порядок обработки.
 	// При пересечении периодов владельцем периода станет датасет с меньшим ID.
 	if err := s.DB.
@@ -97,12 +98,43 @@ func (s *Service) ProcessUnprocessedDatasets(ctx context.Context) error {
 			log.Printf("[Analytics] Ошибка чтения JSON датасета %d: %v", ds.ID, err)
 			continue
 		}
+
 		if len(data) == 0 {
 			log.Printf("[Analytics] Датасет %d пуст, пропускаю", ds.ID)
 			continue
 		}
 
-		// 1) Маппинг (LLM вызывается только если маппинг ещё не сохранён)
+		// Новый путь: агрегированные Excel-отчёты для дашборда.
+		// Для них НЕ нужен LLM-маппинг, потому что это не построчные данные студентов,
+		// а уже готовые агрегаты: контингент, отчисления, переводы/восстановления.
+		reportType := detectDashboardReportType(data)
+
+		if reportType != dashboardReportStudent {
+			log.Printf("[Analytics] Датасет %d определён как агрегированный отчёт: %s", ds.ID, reportType)
+
+			result := computeDashboardAggregateReport(data, reportType, ds.Name)
+
+			if err := s.mergeDashboardAggregateIntoGlobalMetrics(ctx, result, reportType); err != nil {
+				log.Printf("[Analytics] Ошибка обновления глобальных метрик агрегированного отчёта %d: %v", ds.ID, err)
+				continue
+			}
+
+			datasetSummary := buildDashboardDatasetSummary(reportType, result)
+
+			if err := s.DB.Model(&ds).Updates(map[string]interface{}{
+				"summary":      datasetSummary,
+				"is_processed": true,
+			}).Error; err != nil {
+				log.Printf("[Analytics] Ошибка обновления агрегированного датасета %d: %v", ds.ID, err)
+				continue
+			}
+
+			log.Printf("[Analytics] Агрегированный датасет %d успешно обработан: %s", ds.ID, datasetSummary)
+			continue
+		}
+
+		// Старый путь: обычные датасеты студентов.
+		// Здесь LLM определяет соответствие колонок: ФИО, ID, статус, балл и т.д.
 		mapping, err := s.resolveColumnMapping(ctx, &ds, data)
 		if err != nil {
 			log.Printf("[Analytics] Ошибка маппинга для датасета %d: %v", ds.ID, err)
@@ -112,14 +144,15 @@ func (s *Service) ProcessUnprocessedDatasets(ctx context.Context) error {
 		// 2) Детерминированные метрики в Go
 		result := computeMetricsDeterministic(data, mapping)
 
-		// 3) Мердж в global + глобальные инсайты от LLM (один вызов после мерджа)
+		// 3) Мердж в global + глобальные инсайты от LLM
 		if err := s.mergeIntoGlobalMetrics(ctx, result, ds.ID); err != nil {
 			log.Printf("[Analytics] Ошибка обновления глобальных метрик: %v", err)
 			continue
 		}
 
-		// 4) Summary конкретного датасета — без LLM (дешево и детерминированно)
+		// 4) Summary конкретного датасета — без LLM
 		datasetSummary := buildDatasetSummary(result)
+
 		if err := s.DB.Model(&ds).Updates(map[string]interface{}{
 			"summary":      datasetSummary,
 			"is_processed": true,
@@ -129,7 +162,10 @@ func (s *Service) ProcessUnprocessedDatasets(ctx context.Context) error {
 		}
 
 		log.Printf("[Analytics] Датасет %d успешно обработан: %d студентов, %d периодов",
-			ds.ID, result.Metrics.TotalStudents, len(result.TimeSeries))
+			ds.ID,
+			result.Metrics.TotalStudents,
+			len(result.TimeSeries),
+		)
 	}
 
 	return nil
@@ -139,6 +175,7 @@ func buildDatasetSummary(result *LLMResponse) string {
 	if result == nil {
 		return "Датасет обработан."
 	}
+
 	return fmt.Sprintf(
 		"Датасет обработан: студентов=%d, активных=%d, средний балл=%.2f, периодов=%d.",
 		result.Metrics.TotalStudents,
@@ -149,13 +186,357 @@ func buildDatasetSummary(result *LLMResponse) string {
 }
 
 // ==============================================================================
-// 3. МАППИНГ КОЛОНОК (LLM вызывается ОДИН раз, результат кэшируется в Dataset)
+// 2.1. АГРЕГИРОВАННЫЕ ОТЧЁТЫ ДЛЯ ДАШБОРДА
+// ==============================================================================
+
+const (
+	dashboardReportStudent    = "student"
+	dashboardReportContingent = "contingent"
+	dashboardReportMovement   = "movement"
+	dashboardReportDeduction  = "deduction"
+)
+
+func detectDashboardReportType(data []map[string]interface{}) string {
+	headers := collectHeaderIndex(data)
+
+	if hasHeader(headers, "контингент обучающихся") {
+		return dashboardReportContingent
+	}
+
+	if hasHeader(headers,
+		"восстановлены (чел.)",
+		"зачислены переводом из другого вуза/филиала (чел.)",
+		"зачислены переводом из другого вуза/ филиала (чел.)",
+		"переведены в другой вуз/филиал (чел.)",
+		"переведены в другой вуз/ филиал (чел.)",
+		"переведены в другогой вуз/филиал (чел.)",
+		"переведены в другогой вуз/ филиал (чел.)",
+	) {
+		return dashboardReportMovement
+	}
+
+	if hasHeader(headers,
+		"отчислено всего (чел.)",
+		"отчислено ВСЕГО (чел.)",
+		"отчислены за неуспеваемость (чел.)",
+		"отчислены за не оплату обучения (чел.)",
+		"отчислены за неоплату обучения (чел.)",
+		"отчислены по собственному желанию (чел.)",
+		"выпуск (получили образование)(чел.)",
+		"ВЫПУСК (получили образование)(чел.)",
+	) {
+		return dashboardReportDeduction
+	}
+
+	return dashboardReportStudent
+}
+
+func computeDashboardAggregateReport(data []map[string]interface{}, reportType string, datasetName string) *LLMResponse {
+	headers := collectHeaderIndex(data)
+	period := extractPeriodFromDatasetName(datasetName)
+
+	statuses := make(map[string]int64)
+
+	var totalStudents int64
+	var activeStudents int64
+
+	switch reportType {
+	case dashboardReportContingent:
+		contingent := sumColumn(data, headers, "контингент обучающихся")
+
+		totalStudents = contingent
+		activeStudents = contingent
+
+		statuses["контингент обучающихся"] = contingent
+
+	case dashboardReportMovement:
+		restored := sumColumn(data, headers, "восстановлены (чел.)")
+
+		transferIn := sumColumn(data, headers,
+			"зачислены переводом из другого вуза/филиала (чел.)",
+			"зачислены переводом из другого вуза/ филиала (чел.)",
+		)
+
+		transferOut := sumColumn(data, headers,
+			"переведены в другой вуз/филиал (чел.)",
+			"переведены в другой вуз/ филиал (чел.)",
+			"переведены в другогой вуз/филиал (чел.)",
+			"переведены в другогой вуз/ филиал (чел.)",
+		)
+
+		statuses["восстановлены"] = restored
+		statuses["зачислены переводом"] = transferIn
+		statuses["переведены в другой вуз/филиал"] = transferOut
+
+	case dashboardReportDeduction:
+		deductedTotal := sumColumn(data, headers, "отчислено всего (чел.)", "отчислено ВСЕГО (чел.)")
+
+		deductedBadProgress := sumColumn(data, headers,
+			"отчислены за неуспеваемость (чел.)",
+		)
+
+		deductedNonPayment := sumColumn(data, headers,
+			"отчислены за не оплату обучения (чел.)",
+			"отчислены за неоплату обучения (чел.)",
+		)
+
+		deductedVoluntary := sumColumn(data, headers,
+			"отчислены по собственному желанию (чел.)",
+		)
+
+		graduated := sumColumn(data, headers,
+			"выпуск (получили образование)(чел.)",
+			"ВЫПУСК (получили образование)(чел.)",
+		)
+
+		statuses["отчислено всего"] = deductedTotal
+		statuses["отчислены за неуспеваемость"] = deductedBadProgress
+		statuses["отчислены за неоплату обучения"] = deductedNonPayment
+		statuses["отчислены по собственному желанию"] = deductedVoluntary
+		statuses["выпуск"] = graduated
+	}
+
+	timeSeries := []TimePeriodData{
+		{
+			Period:          period,
+			TotalStudents:   totalStudents,
+			ActiveStudents:  activeStudents,
+			AverageScore:    0,
+			StatusBreakdown: statuses,
+			ScoreSum:        0,
+			ScoreCount:      0,
+		},
+	}
+
+	return &LLMResponse{
+		Metrics: MetricsData{
+			TotalStudents:   totalStudents,
+			ActiveStudents:  activeStudents,
+			AverageScore:    0,
+			StatusBreakdown: statuses,
+		},
+		TimeSeries: timeSeries,
+	}
+}
+
+func buildDashboardDatasetSummary(reportType string, result *LLMResponse) string {
+	if result == nil || len(result.TimeSeries) == 0 {
+		return "Агрегированный отчёт обработан."
+	}
+
+	period := result.TimeSeries[0].Period
+	breakdown := formatStatusBreakdown(result.Metrics.StatusBreakdown)
+
+	switch reportType {
+	case dashboardReportContingent:
+		return fmt.Sprintf(
+			"Отчёт по контингенту обработан: период=%s, контингент=%d.",
+			period,
+			result.Metrics.TotalStudents,
+		)
+
+	case dashboardReportMovement:
+		return fmt.Sprintf(
+			"Отчёт по переводам и восстановлениям обработан: период=%s, %s.",
+			period,
+			breakdown,
+		)
+
+	case dashboardReportDeduction:
+		return fmt.Sprintf(
+			"Отчёт по отчислениям обработан: период=%s, %s.",
+			period,
+			breakdown,
+		)
+
+	default:
+		return fmt.Sprintf(
+			"Агрегированный отчёт обработан: период=%s, %s.",
+			period,
+			breakdown,
+		)
+	}
+}
+
+func formatStatusBreakdown(statuses map[string]int64) string {
+	if len(statuses) == 0 {
+		return "показателей нет"
+	}
+
+	keys := make([]string, 0, len(statuses))
+	for k := range statuses {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, fmt.Sprintf("%s=%d", k, statuses[k]))
+	}
+
+	return strings.Join(parts, ", ")
+}
+
+func collectHeaderIndex(data []map[string]interface{}) map[string]string {
+	headers := make(map[string]string)
+
+	for _, row := range data {
+		for original := range row {
+			normalized := normalizeHeaderName(original)
+			if normalized == "" {
+				continue
+			}
+
+			if _, exists := headers[normalized]; !exists {
+				headers[normalized] = original
+			}
+		}
+	}
+
+	return headers
+}
+
+func hasHeader(headers map[string]string, aliases ...string) bool {
+	return findHeader(headers, aliases...) != ""
+}
+
+func findHeader(headers map[string]string, aliases ...string) string {
+	for _, alias := range aliases {
+		normalized := normalizeHeaderName(alias)
+		if original, ok := headers[normalized]; ok {
+			return original
+		}
+	}
+
+	return ""
+}
+
+func normalizeHeaderName(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.ReplaceAll(s, "\u00a0", " ")
+	s = strings.ReplaceAll(s, "\r", " ")
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.ToLower(s)
+	s = strings.ReplaceAll(s, "ё", "е")
+	s = strings.Join(strings.Fields(s), " ")
+
+	s = strings.ReplaceAll(s, " /", "/")
+	s = strings.ReplaceAll(s, "/ ", "/")
+
+	// Опечатки и варианты написания из реальных файлов
+	s = strings.ReplaceAll(s, "реализвции", "реализации")
+	s = strings.ReplaceAll(s, "другогой", "другой")
+	s = strings.ReplaceAll(s, "не оплату", "неоплату")
+
+	return strings.TrimSpace(s)
+}
+
+func sumColumn(data []map[string]interface{}, headers map[string]string, aliases ...string) int64 {
+	col := findHeader(headers, aliases...)
+	if col == "" {
+		return 0
+	}
+
+	var total int64
+
+	for _, row := range data {
+		if isDashboardServiceRow(row, headers) {
+			continue
+		}
+
+		total += toInt64(row[col])
+	}
+
+	return total
+}
+
+func isDashboardServiceRow(row map[string]interface{}, headers map[string]string) bool {
+	directionCol := findHeader(headers, "направление подготовки, специальность")
+	programCol := findHeader(headers, "образовательная программа")
+
+	if directionCol == "" && programCol == "" {
+		return isEmptyDataRow(row)
+	}
+
+	direction := ""
+	program := ""
+
+	if directionCol != "" {
+		direction = normalizeString(row[directionCol])
+	}
+
+	if programCol != "" {
+		program = normalizeString(row[programCol])
+	}
+
+	// В файле "Контингент" есть итоговые числа вне таблицы.
+	// Такие строки обычно без направления и без программы.
+	if direction == "" && program == "" {
+		return true
+	}
+
+	lowerDirection := strings.ToLower(direction)
+	if strings.Contains(lowerDirection, "итого") || strings.Contains(lowerDirection, "всего") {
+		return true
+	}
+
+	return false
+}
+
+func isEmptyDataRow(row map[string]interface{}) bool {
+	for _, v := range row {
+		if normalizeString(v) != "" {
+			return false
+		}
+	}
+
+	return true
+}
+
+func toInt64(val interface{}) int64 {
+	f, ok := toFloat64(val)
+	if !ok {
+		return 0
+	}
+
+	return int64(math.Round(f))
+}
+
+func extractPeriodFromDatasetName(name string) string {
+	parts := strings.FieldsFunc(name, func(r rune) bool {
+		return r < '0' || r > '9'
+	})
+
+	for i := len(parts) - 1; i >= 0; i-- {
+		part := parts[i]
+
+		if len(part) == 4 {
+			year, err := strconv.Atoi(part)
+			if err == nil && year >= 2000 && year <= 2100 {
+				return part
+			}
+		}
+
+		if len(part) == 2 {
+			year, err := strconv.Atoi(part)
+			if err == nil && year >= 16 && year <= 40 {
+				return fmt.Sprintf("20%02d", year)
+			}
+		}
+	}
+
+	return "unknown"
+}
+
+// ==============================================================================
+// 3. МАППИНГ КОЛОНОК
 // ==============================================================================
 
 func (s *Service) resolveColumnMapping(ctx context.Context, ds *models.Dataset, data []map[string]interface{}) (*ColumnMapping, error) {
 	if len(ds.ColumnMapping) > 0 {
 		var mapping ColumnMapping
 		if err := json.Unmarshal(ds.ColumnMapping, &mapping); err == nil {
+			normalizeMappingNulls(&mapping)
 			log.Printf("[Analytics] Используем сохранённый маппинг для датасета %d", ds.ID)
 			return &mapping, nil
 		}
@@ -170,6 +551,7 @@ func (s *Service) resolveColumnMapping(ctx context.Context, ds *models.Dataset, 
 	if err := s.DB.Model(ds).Update("column_mapping", mappingJSON).Error; err != nil {
 		log.Printf("[Analytics] Не удалось сохранить column_mapping для датасета %d: %v", ds.ID, err)
 	}
+
 	log.Printf("[Analytics] Маппинг определён и сохранён для датасета %d: %s", ds.ID, string(mappingJSON))
 
 	return mapping, nil
@@ -180,6 +562,7 @@ func (s *Service) detectColumnMapping(ctx context.Context, data []map[string]int
 	if len(data) < previewLen {
 		previewLen = len(data)
 	}
+
 	sampleJSON, _ := json.MarshalIndent(data[:previewLen], "", "  ")
 	statusHints := collectUniqueValues(data, 50)
 
@@ -224,29 +607,63 @@ func (s *Service) detectColumnMapping(ctx context.Context, data []map[string]int
 		}
 
 		cleaned := cleanLLMJSON(resp)
-		if err := json.Unmarshal([]byte(cleaned), &mapping); err != nil {
+		if cleaned == "" {
+			lastErr = fmt.Errorf("пустой ответ LLM (попытка %d)", attempt)
+			continue
+		}
+
+		var attemptMapping ColumnMapping
+		if err := json.Unmarshal([]byte(cleaned), &attemptMapping); err != nil {
 			lastErr = fmt.Errorf("парсинг ответа (попытка %d): %w, raw: %s", attempt, err, cleaned)
 			continue
 		}
 
-		if mapping.StudentID == nil && mapping.FullName == nil {
+		normalizeMappingNulls(&attemptMapping)
+
+		if attemptMapping.StudentID == nil && attemptMapping.FullName == nil {
 			lastErr = fmt.Errorf("попытка %d: не найден ни student_id, ни full_name", attempt)
 			continue
 		}
 
+		mapping = attemptMapping
 		return &mapping, nil
 	}
 
 	return nil, fmt.Errorf("не удалось получить маппинг за %d попыток: %w", maxRetries, lastErr)
 }
 
+func normalizeMappingNulls(mapping *ColumnMapping) {
+	normalizePtr := func(p **string) {
+		if p == nil || *p == nil {
+			return
+		}
+
+		v := strings.TrimSpace(**p)
+		if v == "" || strings.EqualFold(v, "null") || strings.EqualFold(v, "nil") {
+			*p = nil
+			return
+		}
+
+		**p = v
+	}
+
+	normalizePtr(&mapping.StudentID)
+	normalizePtr(&mapping.FullName)
+	normalizePtr(&mapping.EnrollmentYear)
+	normalizePtr(&mapping.GraduationYear)
+	normalizePtr(&mapping.Status)
+	normalizePtr(&mapping.Score)
+}
+
 func collectUniqueValues(data []map[string]interface{}, limit int) string {
 	uniquePerCol := make(map[string]map[string]bool)
+
 	for _, row := range data {
 		for col, val := range row {
 			if _, ok := uniquePerCol[col]; !ok {
 				uniquePerCol[col] = make(map[string]bool)
 			}
+
 			if len(uniquePerCol[col]) < limit {
 				uniquePerCol[col][fmt.Sprintf("%v", val)] = true
 			}
@@ -254,6 +671,7 @@ func collectUniqueValues(data []map[string]interface{}, limit int) string {
 	}
 
 	var sb strings.Builder
+
 	cols := make([]string, 0, len(uniquePerCol))
 	for col := range uniquePerCol {
 		cols = append(cols, col)
@@ -265,14 +683,16 @@ func collectUniqueValues(data []map[string]interface{}, limit int) string {
 		for v := range uniquePerCol[col] {
 			vals = append(vals, v)
 		}
+
 		sort.Strings(vals)
 		sb.WriteString(fmt.Sprintf("  %s: %s\n", col, strings.Join(vals, ", ")))
 	}
+
 	return sb.String()
 }
 
 // ==============================================================================
-// 4. ДЕТЕРМИНИРОВАННЫЕ ВЫЧИСЛЕНИЯ (Go)
+// 4. ДЕТЕРМИНИРОВАННЫЕ ВЫЧИСЛЕНИЯ
 // ==============================================================================
 
 func computeMetricsDeterministic(data []map[string]interface{}, mapping *ColumnMapping) *LLMResponse {
@@ -310,6 +730,7 @@ func computeMetricsDeterministic(data []map[string]interface{}, mapping *ColumnM
 			if score, ok := toFloat64(row[*mapping.Score]); ok {
 				acc.scoreSum += score
 				acc.scoreCount++
+
 				globalAcc.scoreSum += score
 				globalAcc.scoreCount++
 			}
@@ -317,6 +738,7 @@ func computeMetricsDeterministic(data []map[string]interface{}, mapping *ColumnM
 	}
 
 	var timeSeries []TimePeriodData
+
 	periods := make([]string, 0, len(periodMap))
 	for p := range periodMap {
 		periods = append(periods, p)
@@ -325,6 +747,7 @@ func computeMetricsDeterministic(data []map[string]interface{}, mapping *ColumnM
 
 	for _, period := range periods {
 		acc := periodMap[period]
+
 		timeSeries = append(timeSeries, TimePeriodData{
 			Period:          period,
 			TotalStudents:   acc.totalStudents,
@@ -359,6 +782,7 @@ func (a *periodAccumulator) averageScore() float64 {
 	if a.scoreCount == 0 {
 		return 0
 	}
+
 	return math.Round((a.scoreSum/float64(a.scoreCount))*100) / 100
 }
 
@@ -391,7 +815,10 @@ func deduplicateRows(data []map[string]interface{}, mapping *ColumnMapping) []ma
 
 	log.Printf(
 		"[Analytics] Дедупликация (student+period): %d → %d, дубликатов: %d, hash-fallback: %d",
-		len(data), len(result), skippedDuplicates, usedHashFallback,
+		len(data),
+		len(result),
+		skippedDuplicates,
+		usedHashFallback,
 	)
 
 	return result
@@ -404,12 +831,14 @@ func buildStudentKey(row map[string]interface{}, mapping *ColumnMapping) string 
 			return "id:" + id
 		}
 	}
+
 	if mapping.FullName != nil {
 		name := strings.ToLower(normalizeString(row[*mapping.FullName]))
 		if name != "" {
 			return "name:" + name
 		}
 	}
+
 	return ""
 }
 
@@ -421,6 +850,7 @@ func makeStableRowSignature(row map[string]interface{}) string {
 	sort.Strings(keys)
 
 	var b strings.Builder
+
 	for _, k := range keys {
 		b.WriteString(k)
 		b.WriteString("=")
@@ -454,6 +884,7 @@ func extractPeriod(row map[string]interface{}, mapping *ColumnMapping) string {
 	parts := strings.FieldsFunc(raw, func(r rune) bool {
 		return r == '.' || r == '/' || r == '-'
 	})
+
 	for i := len(parts) - 1; i >= 0; i-- {
 		if len(parts[i]) == 4 {
 			if _, err := strconv.Atoi(parts[i]); err == nil {
@@ -467,16 +898,18 @@ func extractPeriod(row map[string]interface{}, mapping *ColumnMapping) string {
 
 func isActiveStatus(status string, activeStatuses []string) bool {
 	statusLower := strings.ToLower(strings.TrimSpace(status))
+
 	for _, as := range activeStatuses {
 		if strings.ToLower(strings.TrimSpace(as)) == statusLower {
 			return true
 		}
 	}
+
 	return false
 }
 
 // ==============================================================================
-// 5. ТЕКСТОВЫЕ ИНСАЙТЫ (LLM на финальных merged данных)
+// 5. ТЕКСТОВЫЕ ИНСАЙТЫ
 // ==============================================================================
 
 type textInsightsResult struct {
@@ -508,19 +941,32 @@ func (s *Service) generateTextInsights(ctx context.Context, result *LLMResponse)
 	resp, err := s.LLM.AnalyzeData(ctx, prompt, nil)
 	if err != nil {
 		log.Printf("[Analytics] Ошибка получения текстовых инсайтов: %v", err)
+
 		return textInsightsResult{
-			Summary: "Автоматический анализ временно недоступен.",
-			Trends:  []string{},
+			Summary:   "Автоматический анализ временно недоступен.",
+			Trends:    []string{},
+			Anomalies: []string{},
+		}
+	}
+
+	cleaned := cleanLLMJSON(resp)
+	if cleaned == "" {
+		log.Printf("[Analytics] Пустой ответ LLM при генерации инсайтов")
+
+		return textInsightsResult{
+			Summary:   "Автоматический анализ временно недоступен.",
+			Trends:    []string{},
 			Anomalies: []string{},
 		}
 	}
 
 	var insights textInsightsResult
-	if err := json.Unmarshal([]byte(cleanLLMJSON(resp)), &insights); err != nil {
+	if err := json.Unmarshal([]byte(cleaned), &insights); err != nil {
 		log.Printf("[Analytics] Ошибка парсинга инсайтов: %v", err)
+
 		return textInsightsResult{
-			Summary: "Ошибка разбора текстовых инсайтов.",
-			Trends:  []string{},
+			Summary:   "Ошибка разбора текстовых инсайтов.",
+			Trends:    []string{},
 			Anomalies: []string{},
 		}
 	}
@@ -531,6 +977,110 @@ func (s *Service) generateTextInsights(ctx context.Context, result *LLMResponse)
 // ==============================================================================
 // 6. ГЛОБАЛЬНЫЕ МЕТРИКИ + ownership period
 // ==============================================================================
+
+func (s *Service) mergeDashboardAggregateIntoGlobalMetrics(ctx context.Context, newData *LLMResponse, reportType string) error {
+	if newData == nil || len(newData.TimeSeries) == 0 {
+		return nil
+	}
+
+	var (
+		mergedMetrics MetricsData
+		mergedTS      []TimePeriodData
+	)
+
+	err := s.DB.Transaction(func(tx *gorm.DB) error {
+		var global models.GlobalMetric
+		if err := tx.FirstOrCreate(&global, models.GlobalMetric{ID: 1}).Error; err != nil {
+			return err
+		}
+
+		var currentTimeSeries []TimePeriodData
+		if len(global.TimeSeries) > 0 {
+			_ = json.Unmarshal(global.TimeSeries, &currentTimeSeries)
+		}
+
+		tsMap := make(map[string]TimePeriodData, len(currentTimeSeries))
+
+		for _, ts := range currentTimeSeries {
+			if ts.StatusBreakdown == nil {
+				ts.StatusBreakdown = make(map[string]int64)
+			}
+
+			tsMap[ts.Period] = ts
+		}
+
+		incoming := newData.TimeSeries[0]
+		if incoming.StatusBreakdown == nil {
+			incoming.StatusBreakdown = make(map[string]int64)
+		}
+
+		existing, ok := tsMap[incoming.Period]
+		if !ok {
+			existing = TimePeriodData{
+				Period:          incoming.Period,
+				StatusBreakdown: make(map[string]int64),
+			}
+		}
+
+		if existing.StatusBreakdown == nil {
+			existing.StatusBreakdown = make(map[string]int64)
+		}
+
+		// Только отчёт "Контингент" меняет KPI "Всего студентов" и "Активные".
+		// Отчёты "Отчисление" и "Перевод/восстановление" добавляют показатели
+		// в StatusBreakdown, но не увеличивают total_students.
+		if reportType == dashboardReportContingent {
+			existing.TotalStudents = incoming.TotalStudents
+			existing.ActiveStudents = incoming.ActiveStudents
+			existing.AverageScore = incoming.AverageScore
+			existing.ScoreSum = incoming.ScoreSum
+			existing.ScoreCount = incoming.ScoreCount
+		}
+
+		for key, value := range incoming.StatusBreakdown {
+			existing.StatusBreakdown[key] = value
+		}
+
+		tsMap[incoming.Period] = existing
+
+		mergedTS = make([]TimePeriodData, 0, len(tsMap))
+		for _, ts := range tsMap {
+			mergedTS = append(mergedTS, ts)
+		}
+
+		sort.Slice(mergedTS, func(i, j int) bool {
+			return mergedTS[i].Period < mergedTS[j].Period
+		})
+
+		mergedMetrics = recalcMetricsFromTimeSeries(mergedTS)
+
+		global.TotalStudents = mergedMetrics.TotalStudents
+		global.ActiveStudents = mergedMetrics.ActiveStudents
+		global.AverageScore = mergedMetrics.AverageScore
+		global.StatusBreakdown, _ = json.Marshal(mergedMetrics.StatusBreakdown)
+		global.TimeSeries, _ = json.Marshal(mergedTS)
+
+		return tx.Save(&global).Error
+	})
+	if err != nil {
+		return err
+	}
+
+	insights := s.generateTextInsights(ctx, &LLMResponse{
+		Metrics:    mergedMetrics,
+		TimeSeries: mergedTS,
+	})
+
+	trendsJSON, _ := json.Marshal(insights.Trends)
+	anomaliesJSON, _ := json.Marshal(insights.Anomalies)
+
+	return s.DB.Model(&models.GlobalMetric{}).
+		Where("id = ?", 1).
+		Updates(map[string]interface{}{
+			"trends":    trendsJSON,
+			"anomalies": anomaliesJSON,
+		}).Error
+}
 
 func (s *Service) mergeIntoGlobalMetrics(ctx context.Context, newData *LLMResponse, datasetID uint) error {
 	var (
@@ -563,6 +1113,7 @@ func (s *Service) mergeIntoGlobalMetrics(ctx context.Context, newData *LLMRespon
 				Period:    newTs.Period,
 				DatasetID: datasetID,
 			}
+
 			if err := tx.Clauses(clause.OnConflict{
 				Columns:   []clause.Column{{Name: "period"}},
 				DoNothing: true,
@@ -593,6 +1144,7 @@ func (s *Service) mergeIntoGlobalMetrics(ctx context.Context, newData *LLMRespon
 		for _, ts := range tsMap {
 			mergedTS = append(mergedTS, ts)
 		}
+
 		sort.Slice(mergedTS, func(i, j int) bool {
 			return mergedTS[i].Period < mergedTS[j].Period
 		})
@@ -611,7 +1163,7 @@ func (s *Service) mergeIntoGlobalMetrics(ctx context.Context, newData *LLMRespon
 		return err
 	}
 
-	// Инсайты считаем по финальному merged набору (один вызов LLM).
+	// Инсайты считаем по финальному merged набору.
 	insights := s.generateTextInsights(ctx, &LLMResponse{
 		Metrics:    mergedMetrics,
 		TimeSeries: mergedTS,
@@ -639,25 +1191,31 @@ func (s *Service) GetAdvancedMetrics(startDate, endDate string) (*LLMResponse, e
 	}
 
 	response := &LLMResponse{}
+
 	_ = json.Unmarshal(global.TimeSeries, &response.TimeSeries)
 	_ = json.Unmarshal(global.Trends, &response.Trends)
 	_ = json.Unmarshal(global.Anomalies, &response.Anomalies)
 
 	if startDate != "" || endDate != "" {
 		filtered := make([]TimePeriodData, 0, len(response.TimeSeries))
+
 		for _, ts := range response.TimeSeries {
 			if startDate != "" && ts.Period < startDate {
 				continue
 			}
+
 			if endDate != "" && ts.Period > endDate {
 				continue
 			}
+
 			filtered = append(filtered, ts)
 		}
+
 		response.TimeSeries = filtered
 	}
 
 	response.Metrics = recalcMetricsFromTimeSeries(response.TimeSeries)
+
 	return response, nil
 }
 
@@ -671,19 +1229,22 @@ func recalcMetricsFromTimeSeries(timeSeries []TimePeriodData) MetricsData {
 	for _, ts := range timeSeries {
 		total += ts.TotalStudents
 		active += ts.ActiveStudents
+
 		for status, count := range ts.StatusBreakdown {
 			statuses[status] += count
 		}
 
-		// Корректный путь (новые данные)
+		// Корректный путь для новых данных.
 		if ts.ScoreCount > 0 {
 			totalScoreSum += ts.ScoreSum
 			totalScoreCount += ts.ScoreCount
 			continue
 		}
 
-		// Backward-compat для старых записей
-		if ts.TotalStudents > 0 {
+		// Backward-compat для старых записей.
+		// Важно: не считаем AverageScore=0 как настоящий средний балл.
+		// Это защищает агрегированные отчёты "Контингент" без оценок.
+		if ts.AverageScore > 0 && ts.TotalStudents > 0 {
 			totalScoreSum += ts.AverageScore * float64(ts.TotalStudents)
 			totalScoreCount += ts.TotalStudents
 		}
@@ -710,10 +1271,12 @@ func normalizeString(val interface{}) string {
 	if val == nil {
 		return ""
 	}
+
 	s := strings.TrimSpace(fmt.Sprintf("%v", val))
 	if s == "<nil>" {
 		return ""
 	}
+
 	return s
 }
 
@@ -721,24 +1284,43 @@ func toFloat64(val interface{}) (float64, bool) {
 	if val == nil {
 		return 0, false
 	}
+
 	switch v := val.(type) {
 	case float64:
 		return v, true
+
 	case float32:
 		return float64(v), true
+
 	case int:
 		return float64(v), true
+
 	case int64:
 		return float64(v), true
+
+	case int32:
+		return float64(v), true
+
 	case json.Number:
 		f, err := v.Float64()
 		return f, err == nil
+
 	case string:
-		cleaned := strings.Replace(strings.TrimSpace(v), ",", ".", 1)
+		cleaned := strings.TrimSpace(v)
+		cleaned = strings.Replace(cleaned, "\u00a0", "", -1)
+		cleaned = strings.Replace(cleaned, " ", "", -1)
+		cleaned = strings.Replace(cleaned, ",", ".", 1)
+
 		f, err := strconv.ParseFloat(cleaned, 64)
 		return f, err == nil
+
 	default:
 		s := fmt.Sprintf("%v", v)
+		s = strings.TrimSpace(s)
+		s = strings.Replace(s, "\u00a0", "", -1)
+		s = strings.Replace(s, " ", "", -1)
+		s = strings.Replace(s, ",", ".", 1)
+
 		f, err := strconv.ParseFloat(s, 64)
 		return f, err == nil
 	}
@@ -746,8 +1328,10 @@ func toFloat64(val interface{}) (float64, bool) {
 
 func cleanLLMJSON(raw string) string {
 	s := strings.TrimSpace(raw)
+
 	s = strings.TrimPrefix(s, "```json")
 	s = strings.TrimPrefix(s, "```")
 	s = strings.TrimSuffix(s, "```")
+
 	return strings.TrimSpace(s)
 }
