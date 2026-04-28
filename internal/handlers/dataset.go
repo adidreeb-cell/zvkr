@@ -54,11 +54,8 @@ type PythonExecPayload struct {
 }
 
 var (
-	// Ловим присваивание любой из зарезервированных переменных
-	reDatasetAssign = regexp.MustCompile(`(?m)^\s*(dataset|data|rows|records)\s*=\s*[\[{(]`)
-	reForbiddenImp  = regexp.MustCompile(`(?mi)^\s*(import|from)\s+(pandas|numpy)\b`)
-
-	// Для sanitizeCode — ловим однострочные присваивания
+	reDatasetAssign  = regexp.MustCompile(`(?m)^\s*(dataset|data|rows|records)\s*=\s*[\[{(]`)
+	reForbiddenImp   = regexp.MustCompile(`(?mi)^\s*(import|from)\s+(pandas|numpy)\b`)
 	reHardcodedAssign = regexp.MustCompile(`^(dataset|data|rows|records)\s*=`)
 )
 
@@ -126,13 +123,19 @@ func validateExecutionContract(output string, totalRows int) string {
 	}
 
 	if payload.Meta.TotalRowsExpected != totalRows {
-		return fmt.Sprintf("meta.total_rows_expected mismatch: got %d, want %d",
-			payload.Meta.TotalRowsExpected, totalRows)
+		return fmt.Sprintf(
+			"meta.total_rows_expected mismatch: got %d, want %d",
+			payload.Meta.TotalRowsExpected,
+			totalRows,
+		)
 	}
 
 	if payload.Meta.ScannedRows != totalRows {
-		return fmt.Sprintf("meta.scanned_rows mismatch: got %d, want %d",
-			payload.Meta.ScannedRows, totalRows)
+		return fmt.Sprintf(
+			"meta.scanned_rows mismatch: got %d, want %d",
+			payload.Meta.ScannedRows,
+			totalRows,
+		)
 	}
 
 	if payload.Meta.UsedRows < 0 || payload.Meta.UsedRows > totalRows {
@@ -143,12 +146,9 @@ func validateExecutionContract(output string, totalRows int) string {
 		return "summary is required"
 	}
 
-	// charts может быть пустым — нормальный кейс.
 	return ""
 }
 
-// buildSandboxGuard генерирует Python-код, который вставляется ПЕРЕД
-// пользовательским скриптом. Проверяет, что dataset не был перезаписан.
 func buildSandboxGuard(expectedRows int) string {
 	return fmt.Sprintf(`
 # === SANDBOX GUARD (injected) ===
@@ -178,7 +178,7 @@ func (h *DatasetHandler) GetChatHistory(c *fiber.Ctx) error {
 }
 
 // ---------------------------------------------------------------------
-// HTTP HANDLERS (CRUD)
+// HTTP HANDLERS
 // ---------------------------------------------------------------------
 
 func (h *DatasetHandler) Upload(c *fiber.Ctx) error {
@@ -285,6 +285,9 @@ func (h *DatasetHandler) Chat(c *fiber.Ctx) error {
 	}
 
 	originalMessage := strings.TrimSpace(req.Message)
+	if originalMessage == "" {
+		return c.Status(400).JSON(fiber.Map{"error": "Message is required"})
+	}
 
 	userMsg := models.ChatMessage{
 		DatasetID: uint(id),
@@ -307,21 +310,19 @@ func (h *DatasetHandler) Chat(c *fiber.Ctx) error {
 	}
 
 	log.Printf("[Chat] ID: %d | Rows: %d | CodeMode: %v | NewsMode: %v",
-		id, len(dataObj), req.UseCode, req.UseNews)
+		id,
+		len(dataObj),
+		req.UseCode,
+		req.UseNews,
+	)
 
-	// В code-режиме новости НЕ подмешиваем — они раздувают prompt и
-	// ухудшают качество кодогенерации.
-	//
-	// Но агрегированные Excel-отчёты для дашборда не отправляем в Python-песочницу:
-	// - если пользователь просит график, строим chart JSON напрямую;
-	// - если пользователь задаёт обычный вопрос, отвечаем через LLM по рассчитанной сводке.
 	if req.UseCode {
 		if dashboardKind := detectDashboardDatasetKind(dataObj); dashboardKind != dashboardDatasetUnknown {
 			if isChartRequest(originalMessage) {
-				return h.handleDashboardAggregateAnalysis(c, originalMessage, dataObj, id, dashboardKind)
+				return h.handleDashboardAggregateChart(c, originalMessage, dataObj, id, dashboardKind)
 			}
 
-			return h.handleDashboardAggregateTextAnalysis(c, originalMessage, dataObj, id, dashboardKind)
+			return h.handleDashboardAggregateText(c, originalMessage, dataObj, id, dashboardKind)
 		}
 
 		return h.handleCodeAnalysis(c, req.Message, dataObj, id)
@@ -354,7 +355,7 @@ func (h *DatasetHandler) Chat(c *fiber.Ctx) error {
 }
 
 // ---------------------------------------------------------------------
-// STRATEGY 0: DETERMINISTIC DASHBOARD AGGREGATE ANALYSIS
+// STRATEGY 0: FLEXIBLE DASHBOARD AGGREGATE ANALYSIS
 // ---------------------------------------------------------------------
 
 const (
@@ -363,6 +364,16 @@ const (
 	dashboardDatasetMovement   = "movement"
 	dashboardDatasetDeduction  = "deduction"
 )
+
+type DashboardChartPlan struct {
+	Type     string   `json:"type"`
+	Title    string   `json:"title"`
+	XColumn  string   `json:"x_column"`
+	YColumns []string `json:"y_columns"`
+	SortBy   string   `json:"sort_by"`
+	SortDesc bool     `json:"sort_desc"`
+	Limit    int      `json:"limit"`
+}
 
 func detectDashboardDatasetKind(data []map[string]interface{}) string {
 	headers := make(map[string]bool)
@@ -411,7 +422,12 @@ func isChartRequest(message string) bool {
 		"линейн",
 		"построй",
 		"нарисуй",
-		"покажи динамику",
+		"покажи",
+		"сравни",
+		"распределение",
+		"динамик",
+		"топ",
+		"top",
 	}
 
 	for _, keyword := range keywords {
@@ -423,7 +439,7 @@ func isChartRequest(message string) bool {
 	return false
 }
 
-func (h *DatasetHandler) handleDashboardAggregateTextAnalysis(
+func (h *DatasetHandler) handleDashboardAggregateText(
 	c *fiber.Ctx,
 	query string,
 	data []map[string]interface{},
@@ -464,9 +480,7 @@ func (h *DatasetHandler) handleDashboardAggregateTextAnalysis(
 			CreatedAt: time.Now(),
 		})
 
-		return c.Status(500).JSON(fiber.Map{
-			"error": err.Error(),
-		})
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
 	}
 
 	h.DB.Create(&models.ChatMessage{
@@ -484,17 +498,16 @@ func (h *DatasetHandler) handleDashboardAggregateTextAnalysis(
 	})
 }
 
-func (h *DatasetHandler) handleDashboardAggregateAnalysis(
+func (h *DatasetHandler) handleDashboardAggregateChart(
 	c *fiber.Ctx,
 	query string,
 	data []map[string]interface{},
 	id int,
 	kind string,
 ) error {
-	chartData := buildDashboardChartData(data, kind)
-
-	if len(chartData) == 0 {
-		msg := "Не удалось построить график: в агрегированном отчёте не найдено строк с числовыми показателями."
+	plan, err := h.buildDashboardChartPlan(c.Context(), query, data, kind)
+	if err != nil {
+		msg := "Не удалось построить график по запросу: " + err.Error()
 
 		h.DB.Create(&models.ChatMessage{
 			DatasetID: uint(id),
@@ -504,49 +517,65 @@ func (h *DatasetHandler) handleDashboardAggregateAnalysis(
 			CreatedAt: time.Now(),
 		})
 
-		return c.Status(400).JSON(fiber.Map{
-			"error": msg,
+		return c.Status(500).JSON(fiber.Map{"error": msg})
+	}
+
+	chartData, yKeys, err := buildDashboardChartDataFromPlan(data, plan)
+	if err != nil {
+		msg := "Не удалось подготовить данные графика: " + err.Error()
+
+		h.DB.Create(&models.ChatMessage{
+			DatasetID: uint(id),
+			Role:      "bot",
+			Content:   msg,
+			IsError:   true,
+			CreatedAt: time.Now(),
 		})
+
+		return c.Status(400).JSON(fiber.Map{"error": msg})
 	}
 
-	sort.Slice(chartData, func(i, j int) bool {
-		return maxDashboardPointValue(chartData[i]) > maxDashboardPointValue(chartData[j])
-	})
+	if len(chartData) == 0 {
+		msg := "Не удалось построить график: по выбранным колонкам не найдено числовых значений."
 
-	if len(chartData) > 20 {
-		chartData = chartData[:20]
+		h.DB.Create(&models.ChatMessage{
+			DatasetID: uint(id),
+			Role:      "bot",
+			Content:   msg,
+			IsError:   true,
+			CreatedAt: time.Now(),
+		})
+
+		return c.Status(400).JSON(fiber.Map{"error": msg})
 	}
 
-	yKeys := collectDashboardYKeys(chartData)
-
-	title := "Показатели по образовательным программам"
-	switch kind {
-	case dashboardDatasetContingent:
-		title = "Контингент обучающихся по образовательным программам"
-	case dashboardDatasetMovement:
-		title = "Переводы и восстановления по образовательным программам"
-	case dashboardDatasetDeduction:
-		title = "Отчисления и выпуск по образовательным программам"
+	title := strings.TrimSpace(plan.Title)
+	if title == "" {
+		title = "График по данным отчёта"
 	}
+
+	chartType := normalizeChartType(plan.Type)
 
 	codeOutput := map[string]interface{}{
 		"meta": map[string]interface{}{
 			"scanned_rows":          len(data),
 			"used_rows":             len(chartData),
 			"total_rows_expected":   len(data),
-			"mode":                  "dashboard_aggregate",
+			"mode":                  "dashboard_aggregate_llm_planned",
 			"dashboard_report_type": kind,
+			"chart_plan":            plan,
 		},
 		"summary": map[string]interface{}{
-			"message": "График построен напрямую по агрегированному Excel-отчёту без запуска Python-песочницы.",
-			"query":   query,
+			"message":   "График построен по плану LLM. Значения посчитаны детерминированно по данным файла.",
+			"query":     query,
+			"x_column":  plan.XColumn,
+			"y_columns": plan.YColumns,
 		},
 		"charts": []map[string]interface{}{
 			{
-				"type":  "bar",
+				"type":  chartType,
 				"title": title,
 
-				// Два варианта ключей оставлены для совместимости с разными ChartRenderer.
 				"xKey":  "name",
 				"x_key": "name",
 				"yKeys": yKeys,
@@ -560,9 +589,10 @@ func (h *DatasetHandler) handleDashboardAggregateAnalysis(
 	codeOutputJSON, _ := json.Marshal(codeOutput)
 
 	reply := fmt.Sprintf(
-		"График построен по агрегированному отчёту. Использовано строк: %d. Тип отчёта: %s.",
+		"График построен по вашему запросу. X: %s. Y: %s. Использовано строк: %d.",
+		plan.XColumn,
+		strings.Join(plan.YColumns, ", "),
 		len(chartData),
-		kind,
 	)
 
 	h.DB.Create(&models.ChatMessage{
@@ -584,57 +614,392 @@ func (h *DatasetHandler) handleDashboardAggregateAnalysis(
 	})
 }
 
-func buildDashboardAggregateSummary(data []map[string]interface{}, kind string) map[string]interface{} {
-	chartData := buildDashboardChartData(data, kind)
+func (h *DatasetHandler) buildDashboardChartPlan(
+	ctx context.Context,
+	query string,
+	data []map[string]interface{},
+	kind string,
+) (DashboardChartPlan, error) {
+	headers := collectDashboardHeaders(data)
+	numericHeaders := collectDashboardNumericHeaders(data)
+	sample := collectDashboardSampleRows(data, 15)
 
-	result := map[string]interface{}{
-		"report_type": kind,
-		"rows_total":  len(data),
-		"rows_used":   len(chartData),
-		"totals":      map[string]float64{},
-		"top":         []map[string]interface{}{},
+	prompt := fmt.Sprintf(`Ты аналитик данных и проектировщик графиков.
+
+Пользователь просит:
+%s
+
+Тип отчёта:
+%s
+
+Это агрегированный Excel-отчёт, НЕ список студентов.
+
+Доступные колонки:
+%s
+
+Колонки, где есть числовые значения:
+%s
+
+Пример строк:
+%s
+
+Твоя задача — выбрать, какой график построить по запросу пользователя.
+НЕ считай числа сам. Только выбери колонки и параметры графика.
+Имена колонок бери ТОЧНО из списка доступных колонок.
+
+Верни СТРОГО JSON без markdown и пояснений:
+{
+  "type": "bar | line | pie",
+  "title": "название графика",
+  "x_column": "точное имя колонки для подписей по оси X",
+  "y_columns": ["точное имя числовой колонки 1", "точное имя числовой колонки 2"],
+  "sort_by": "точное имя числовой колонки для сортировки или пустая строка",
+  "sort_desc": true,
+  "limit": 20
+}
+
+Правила:
+- Если пользователь просит сравнение программ/направлений — x_column обычно образовательная программа или направление.
+- Если пользователь просит форму обучения — x_column должна быть колонка формы обучения.
+- Если пользователь просит уровень образования — x_column должна быть колонка уровня образования.
+- Если пользователь просит причины отчислений — y_columns должны быть колонки причин отчисления.
+- Если пользователь просит переводы — y_columns должны быть колонки переводов/восстановлений.
+- Если пользователь просит контингент — y_columns должна включать колонку контингента.
+- Для круговой диаграммы используй только одну y_column.
+- limit поставь разумно: 10, 15, 20 или 30.`,
+		query,
+		kind,
+		toPrettyJSON(headers),
+		toPrettyJSON(numericHeaders),
+		toPrettyJSON(sample),
+	)
+
+	resp, err := h.LLM.AnalyzeData(ctx, prompt, nil)
+	if err != nil {
+		return DashboardChartPlan{}, err
 	}
 
-	totals := make(map[string]float64)
+	cleaned := cleanDashboardLLMJSON(resp)
+	if cleaned == "" {
+		return DashboardChartPlan{}, fmt.Errorf("LLM вернула пустой план графика")
+	}
 
-	for _, row := range chartData {
-		for key, value := range row {
-			if key == "name" {
-				continue
-			}
+	var plan DashboardChartPlan
+	if err := json.Unmarshal([]byte(cleaned), &plan); err != nil {
+		return DashboardChartPlan{}, fmt.Errorf("не удалось разобрать JSON-план графика: %w; raw=%s", err, cleaned)
+	}
 
-			switch v := value.(type) {
-			case float64:
-				totals[key] += v
-			case int:
-				totals[key] += float64(v)
-			case int64:
-				totals[key] += float64(v)
-			case int32:
-				totals[key] += float64(v)
-			}
+	if err := validateDashboardChartPlan(plan, headers, numericHeaders); err != nil {
+		return DashboardChartPlan{}, err
+	}
+
+	plan.Type = normalizeChartType(plan.Type)
+
+	if plan.Title == "" {
+		plan.Title = "График по данным отчёта"
+	}
+
+	if plan.Limit <= 0 {
+		plan.Limit = 20
+	}
+	if plan.Limit > 50 {
+		plan.Limit = 50
+	}
+
+	if plan.SortBy == "" && len(plan.YColumns) > 0 {
+		plan.SortBy = plan.YColumns[0]
+	}
+
+	return plan, nil
+}
+
+func validateDashboardChartPlan(plan DashboardChartPlan, headers []string, numericHeaders []string) error {
+	if resolveDashboardColumnName(headers, plan.XColumn) == "" {
+		return fmt.Errorf("LLM выбрала неизвестную x_column: %q", plan.XColumn)
+	}
+
+	if len(plan.YColumns) == 0 {
+		return fmt.Errorf("LLM не выбрала y_columns")
+	}
+
+	for _, yCol := range plan.YColumns {
+		if resolveDashboardColumnName(numericHeaders, yCol) == "" {
+			return fmt.Errorf("LLM выбрала неизвестную или нечисловую y_column: %q", yCol)
 		}
 	}
 
+	if plan.SortBy != "" {
+		if resolveDashboardColumnName(numericHeaders, plan.SortBy) == "" {
+			return fmt.Errorf("LLM выбрала неизвестную или нечисловую sort_by: %q", plan.SortBy)
+		}
+	}
+
+	return nil
+}
+
+func buildDashboardChartDataFromPlan(
+	data []map[string]interface{},
+	plan DashboardChartPlan,
+) ([]map[string]interface{}, []string, error) {
+	headers := collectDashboardHeaders(data)
+
+	xCol := resolveDashboardColumnName(headers, plan.XColumn)
+	if xCol == "" {
+		return nil, nil, fmt.Errorf("колонка X не найдена: %s", plan.XColumn)
+	}
+
+	resolvedYCols := make([]string, 0, len(plan.YColumns))
+	for _, yCol := range plan.YColumns {
+		resolved := resolveDashboardColumnName(headers, yCol)
+		if resolved == "" {
+			return nil, nil, fmt.Errorf("колонка Y не найдена: %s", yCol)
+		}
+		resolvedYCols = append(resolvedYCols, resolved)
+	}
+
+	yKeys := make([]string, 0, len(resolvedYCols))
+	yKeyByColumn := make(map[string]string)
+
+	for _, col := range resolvedYCols {
+		key := shortDashboardMetricName(col)
+		if key == "" {
+			key = col
+		}
+
+		originalKey := key
+		idx := 2
+		for containsString(yKeys, key) {
+			key = fmt.Sprintf("%s_%d", originalKey, idx)
+			idx++
+		}
+
+		yKeys = append(yKeys, key)
+		yKeyByColumn[col] = key
+	}
+
+	type accRow struct {
+		Name   string
+		Values map[string]float64
+	}
+
+	grouped := make(map[string]*accRow)
+
+	for _, row := range data {
+		if isDashboardServiceRow(row) {
+			continue
+		}
+
+		label := strings.TrimSpace(fmt.Sprintf("%v", getValueByColumnName(row, xCol)))
+		if label == "" || label == "<nil>" {
+			continue
+		}
+
+		acc, ok := grouped[label]
+		if !ok {
+			acc = &accRow{
+				Name:   label,
+				Values: make(map[string]float64),
+			}
+			grouped[label] = acc
+		}
+
+		for _, col := range resolvedYCols {
+			value := dashboardValueToFloat(getValueByColumnName(row, col))
+			key := yKeyByColumn[col]
+			acc.Values[key] += value
+		}
+	}
+
+	chartData := make([]map[string]interface{}, 0, len(grouped))
+
+	for _, acc := range grouped {
+		point := map[string]interface{}{
+			"name": acc.Name,
+		}
+
+		hasValue := false
+
+		for _, key := range yKeys {
+			value := acc.Values[key]
+			point[key] = value
+			if value != 0 {
+				hasValue = true
+			}
+		}
+
+		if hasValue {
+			chartData = append(chartData, point)
+		}
+	}
+
+	sortKey := ""
+	if plan.SortBy != "" {
+		resolvedSort := resolveDashboardColumnName(headers, plan.SortBy)
+		sortKey = yKeyByColumn[resolvedSort]
+	}
+	if sortKey == "" && len(yKeys) > 0 {
+		sortKey = yKeys[0]
+	}
+
+	if sortKey != "" {
+		sort.Slice(chartData, func(i, j int) bool {
+			left := dashboardValueToFloat(chartData[i][sortKey])
+			right := dashboardValueToFloat(chartData[j][sortKey])
+
+			if plan.SortDesc {
+				return left > right
+			}
+
+			return left < right
+		})
+	}
+
+	if plan.Limit > 0 && len(chartData) > plan.Limit {
+		chartData = chartData[:plan.Limit]
+	}
+
+	return chartData, yKeys, nil
+}
+
+func buildDashboardAggregateSummary(data []map[string]interface{}, kind string) map[string]interface{} {
+	headers := collectDashboardHeaders(data)
+	numericHeaders := collectDashboardNumericHeaders(data)
+
+	result := map[string]interface{}{
+		"report_type":     kind,
+		"rows_total":      len(data),
+		"headers":         headers,
+		"numeric_headers": numericHeaders,
+		"totals":          map[string]float64{},
+		"top_by_metric":   map[string][]map[string]interface{}{},
+	}
+
+	totals := make(map[string]float64)
+	topByMetric := make(map[string][]map[string]interface{})
+
+	labelColumns := []string{
+		"Образовательная программа",
+		"разовательная программа",
+		"Направление подготовки, специальность",
+		"Форма обучения",
+		"уровень образования",
+	}
+
+	for _, metricCol := range numericHeaders {
+		resolvedMetric := resolveDashboardColumnName(headers, metricCol)
+		if resolvedMetric == "" {
+			continue
+		}
+
+		rowsForMetric := make([]map[string]interface{}, 0)
+
+		for _, row := range data {
+			if isDashboardServiceRow(row) {
+				continue
+			}
+
+			value := dashboardValueToFloat(getValueByColumnName(row, resolvedMetric))
+			if value == 0 {
+				continue
+			}
+
+			label := ""
+			for _, labelCol := range labelColumns {
+				resolvedLabel := resolveDashboardColumnName(headers, labelCol)
+				if resolvedLabel == "" {
+					continue
+				}
+
+				label = strings.TrimSpace(fmt.Sprintf("%v", getValueByColumnName(row, resolvedLabel)))
+				if label != "" && label != "<nil>" {
+					break
+				}
+			}
+
+			if label == "" {
+				label = "Без названия"
+			}
+
+			totals[resolvedMetric] += value
+
+			rowsForMetric = append(rowsForMetric, map[string]interface{}{
+				"name":  label,
+				"value": value,
+			})
+		}
+
+		sort.Slice(rowsForMetric, func(i, j int) bool {
+			return dashboardValueToFloat(rowsForMetric[i]["value"]) > dashboardValueToFloat(rowsForMetric[j]["value"])
+		})
+
+		if len(rowsForMetric) > 10 {
+			rowsForMetric = rowsForMetric[:10]
+		}
+
+		topByMetric[resolvedMetric] = rowsForMetric
+	}
+
 	result["totals"] = totals
-
-	sort.Slice(chartData, func(i, j int) bool {
-		return maxDashboardPointValue(chartData[i]) > maxDashboardPointValue(chartData[j])
-	})
-
-	topLimit := 10
-	if len(chartData) < topLimit {
-		topLimit = len(chartData)
-	}
-
-	if topLimit > 0 {
-		result["top"] = chartData[:topLimit]
-	}
+	result["top_by_metric"] = topByMetric
 
 	return result
 }
 
-func buildDashboardChartData(data []map[string]interface{}, kind string) []map[string]interface{} {
+func collectDashboardHeaders(data []map[string]interface{}) []string {
+	set := make(map[string]string)
+
+	for _, row := range data {
+		for key := range row {
+			normalized := normalizeDashboardHeader(key)
+			if normalized == "" {
+				continue
+			}
+
+			if _, exists := set[normalized]; !exists {
+				set[normalized] = key
+			}
+		}
+	}
+
+	headers := make([]string, 0, len(set))
+	for _, original := range set {
+		headers = append(headers, original)
+	}
+
+	sort.Strings(headers)
+
+	return headers
+}
+
+func collectDashboardNumericHeaders(data []map[string]interface{}) []string {
+	headers := collectDashboardHeaders(data)
+	numericSet := make(map[string]bool)
+
+	for _, header := range headers {
+		for _, row := range data {
+			if isDashboardServiceRow(row) {
+				continue
+			}
+
+			value := getValueByColumnName(row, header)
+			if dashboardValueToFloat(value) != 0 {
+				numericSet[header] = true
+				break
+			}
+		}
+	}
+
+	result := make([]string, 0, len(numericSet))
+	for header := range numericSet {
+		result = append(result, header)
+	}
+
+	sort.Strings(result)
+
+	return result
+}
+
+func collectDashboardSampleRows(data []map[string]interface{}, limit int) []map[string]interface{} {
 	result := make([]map[string]interface{}, 0)
 
 	for _, row := range data {
@@ -642,111 +1007,47 @@ func buildDashboardChartData(data []map[string]interface{}, kind string) []map[s
 			continue
 		}
 
-		direction := getDashboardString(row, "Направление подготовки, специальность")
-		program := getDashboardString(row, "Образовательная программа", "разовательная программа")
-
-		label := program
-		if label == "" {
-			label = direction
-		}
-		if label == "" {
-			continue
-		}
-
-		point := map[string]interface{}{
-			"name": label,
-		}
-
-		hasValue := false
-
-		switch kind {
-		case dashboardDatasetContingent:
-			contingent := getDashboardNumber(row, "контингент обучающихся")
-			if contingent > 0 {
-				point["контингент"] = contingent
-				hasValue = true
-			}
-
-		case dashboardDatasetMovement:
-			restored := getDashboardNumber(row, "восстановлены (чел.)")
-
-			transferIn := getDashboardNumber(row,
-				"зачислены переводом из другого вуза/филиала (чел.)",
-				"зачислены переводом из другого вуза/ филиала (чел.)",
-			)
-
-			transferOut := getDashboardNumber(row,
-				"переведены в другой вуз/филиал (чел.)",
-				"переведены в другой вуз/ филиал (чел.)",
-				"переведены в другогой вуз/филиал (чел.)",
-				"переведены в другогой вуз/ филиал (чел.)",
-			)
-
-			if restored > 0 {
-				point["восстановлены"] = restored
-				hasValue = true
-			}
-			if transferIn > 0 {
-				point["зачислены переводом"] = transferIn
-				hasValue = true
-			}
-			if transferOut > 0 {
-				point["переведены"] = transferOut
-				hasValue = true
-			}
-
-		case dashboardDatasetDeduction:
-			deductedTotal := getDashboardNumber(row,
-				"отчислено всего (чел.)",
-				"отчислено ВСЕГО (чел.)",
-			)
-
-			badProgress := getDashboardNumber(row,
-				"отчислены за неуспеваемость (чел.)",
-			)
-
-			nonPayment := getDashboardNumber(row,
-				"отчислены за не оплату обучения (чел.)",
-				"отчислены за неоплату обучения (чел.)",
-			)
-
-			voluntary := getDashboardNumber(row,
-				"отчислены по собственному желанию (чел.)",
-			)
-
-			graduated := getDashboardNumber(row,
-				"выпуск (получили образование)(чел.)",
-				"ВЫПУСК (получили образование)(чел.)",
-			)
-
-			if deductedTotal > 0 {
-				point["отчислено всего"] = deductedTotal
-				hasValue = true
-			}
-			if badProgress > 0 {
-				point["неуспеваемость"] = badProgress
-				hasValue = true
-			}
-			if nonPayment > 0 {
-				point["неоплата"] = nonPayment
-				hasValue = true
-			}
-			if voluntary > 0 {
-				point["собственное желание"] = voluntary
-				hasValue = true
-			}
-			if graduated > 0 {
-				point["выпуск"] = graduated
-				hasValue = true
-			}
-		}
-
-		if hasValue {
-			result = append(result, point)
+		result = append(result, row)
+		if len(result) >= limit {
+			break
 		}
 	}
 
 	return result
+}
+
+func resolveDashboardColumnName(headers []string, requested string) string {
+	requestedNorm := normalizeDashboardHeader(requested)
+	if requestedNorm == "" {
+		return ""
+	}
+
+	for _, header := range headers {
+		if normalizeDashboardHeader(header) == requestedNorm {
+			return header
+		}
+	}
+
+	for _, header := range headers {
+		headerNorm := normalizeDashboardHeader(header)
+		if strings.Contains(headerNorm, requestedNorm) || strings.Contains(requestedNorm, headerNorm) {
+			return header
+		}
+	}
+
+	return ""
+}
+
+func getValueByColumnName(row map[string]interface{}, column string) interface{} {
+	normalizedColumn := normalizeDashboardHeader(column)
+
+	for key, value := range row {
+		if normalizeDashboardHeader(key) == normalizedColumn {
+			return value
+		}
+	}
+
+	return nil
 }
 
 func normalizeDashboardHeader(s string) string {
@@ -769,31 +1070,19 @@ func normalizeDashboardHeader(s string) string {
 }
 
 func getDashboardString(row map[string]interface{}, aliases ...string) string {
-	for key, value := range row {
-		normalizedKey := normalizeDashboardHeader(key)
+	headers := collectDashboardHeaders([]map[string]interface{}{row})
 
-		for _, alias := range aliases {
-			if normalizedKey == normalizeDashboardHeader(alias) {
-				return strings.TrimSpace(fmt.Sprintf("%v", value))
-			}
+	for _, alias := range aliases {
+		resolved := resolveDashboardColumnName(headers, alias)
+		if resolved == "" {
+			continue
 		}
+
+		value := getValueByColumnName(row, resolved)
+		return strings.TrimSpace(fmt.Sprintf("%v", value))
 	}
 
 	return ""
-}
-
-func getDashboardNumber(row map[string]interface{}, aliases ...string) float64 {
-	for key, value := range row {
-		normalizedKey := normalizeDashboardHeader(key)
-
-		for _, alias := range aliases {
-			if normalizedKey == normalizeDashboardHeader(alias) {
-				return dashboardValueToFloat(value)
-			}
-		}
-	}
-
-	return 0
 }
 
 func dashboardValueToFloat(value interface{}) float64 {
@@ -849,56 +1138,66 @@ func isDashboardServiceRow(row map[string]interface{}) bool {
 	return false
 }
 
-func maxDashboardPointValue(point map[string]interface{}) float64 {
-	var maxValue float64
+func shortDashboardMetricName(column string) string {
+	normalized := normalizeDashboardHeader(column)
 
-	for key, value := range point {
-		if key == "name" {
-			continue
-		}
+	replacer := strings.NewReplacer(
+		"(чел.)", "",
+		"чел.", "",
+		"обучающихся", "",
+		"обучения", "",
+		"образование", "",
+	)
 
-		switch v := value.(type) {
-		case float64:
-			if v > maxValue {
-				maxValue = v
-			}
-		case int:
-			if float64(v) > maxValue {
-				maxValue = float64(v)
-			}
-		case int64:
-			if float64(v) > maxValue {
-				maxValue = float64(v)
-			}
-		case int32:
-			if float64(v) > maxValue {
-				maxValue = float64(v)
-			}
-		}
+	result := replacer.Replace(normalized)
+	result = strings.TrimSpace(result)
+	result = strings.Join(strings.Fields(result), " ")
+
+	if result == "" {
+		return column
 	}
 
-	return maxValue
+	return result
 }
 
-func collectDashboardYKeys(data []map[string]interface{}) []string {
-	set := make(map[string]bool)
+func normalizeChartType(chartType string) string {
+	t := strings.ToLower(strings.TrimSpace(chartType))
 
-	for _, row := range data {
-		for key := range row {
-			if key != "name" {
-				set[key] = true
-			}
+	switch t {
+	case "line", "линейный", "линейная":
+		return "line"
+	case "pie", "круговой", "круговая":
+		return "pie"
+	default:
+		return "bar"
+	}
+}
+
+func cleanDashboardLLMJSON(raw string) string {
+	s := strings.TrimSpace(raw)
+
+	s = strings.TrimPrefix(s, "```json")
+	s = strings.TrimPrefix(s, "```")
+	s = strings.TrimSuffix(s, "```")
+	s = strings.TrimSpace(s)
+
+	start := strings.Index(s, "{")
+	end := strings.LastIndex(s, "}")
+	if start >= 0 && end > start {
+		s = s[start : end+1]
+	}
+
+	return strings.TrimSpace(s)
+}
+
+func containsString(items []string, target string) bool {
+	for _, item := range items {
+		if item == target {
+			return true
 		}
 	}
 
-	keys := make([]string, 0, len(set))
-	for key := range set {
-		keys = append(keys, key)
-	}
-
-	sort.Strings(keys)
-
-	return keys
+	return false
 }
 
 func toPrettyJSON(v interface{}) string {
