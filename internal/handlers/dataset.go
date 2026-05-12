@@ -253,6 +253,21 @@ func (h *DatasetHandler) GetDataset(c *fiber.Ctx) error {
 	return c.JSON(dataset)
 }
 
+func (h *DatasetHandler) RemoveDataset(c *fiber.Ctx) error {
+	id, _ := strconv.Atoi(c.Params("id"))
+
+	var dataset models.Dataset
+	if err := h.DB.First(&dataset, id).Error; err != nil {
+		return c.Status(404).JSON(fiber.Map{"error": "Dataset not found"})
+	}
+
+	if err := h.DB.Delete(&dataset).Error; err != nil {
+		return c.Status(501).JSON(fiber.Map{"error": "Error delete dataset"})
+	}
+
+	return c.JSON(dataset)
+}
+
 func (h *DatasetHandler) RunPython(c *fiber.Ctx) error {
 	var req struct {
 		Code string `json:"code"`

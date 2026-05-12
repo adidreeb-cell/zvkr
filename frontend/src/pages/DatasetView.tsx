@@ -4,6 +4,7 @@ import { Icons } from "../components/ui/Icons";
 import { ChatInterface } from "../components/chat/ChatInterface";
 import { DataGrid } from "../components/data/DataGrid";
 import type { Dataset } from "../types";
+import { route } from "preact-router";
 
 interface DatasetViewProps {
   id?: string;
@@ -12,6 +13,7 @@ interface DatasetViewProps {
 export function DatasetView({ id }: DatasetViewProps) {
   const [dataset, setDataset] = useState<Dataset | null>(null);
   const [activeTab, setActiveTab] = useState<"chat" | "data">("chat");
+  const role = localStorage.getItem("role");
 
   useEffect(() => {
     if (!id) return;
@@ -27,6 +29,17 @@ export function DatasetView({ id }: DatasetViewProps) {
       })
       .catch(console.error);
   }, [id]);
+
+  const removeDataset = async (id: string) => {
+    try {
+      const res = await apiFetch(`/datasets/${id}/remove`);
+      if (!res.ok) throw new Error("Ошибка удаление датасет");
+
+      setTimeout(() => route("/", true), 0);
+    } catch (e: any) {
+      alert(e.message);
+    }
+  };
 
   const downloadFile = async (type: "excel" | "pdf") => {
     try {
@@ -92,6 +105,15 @@ export function DatasetView({ id }: DatasetViewProps) {
           </div>
         </div>
         <div class="flex space-x-3">
+          {role === "admin" && (
+            <button
+              onClick={() => removeDataset(id)}
+              class="flex items-center space-x-1.5 text-xs text-gray-400 bg-black border border-red-400 px-3 py-1.5 rounded-lg hover:text-white transition"
+            >
+              Удалить датасет
+            </button>
+          )}
+
           <button
             onClick={() => downloadFile("excel")}
             class="flex items-center space-x-1.5 text-xs text-gray-400 bg-black border border-border px-3 py-1.5 rounded-lg hover:text-white transition"

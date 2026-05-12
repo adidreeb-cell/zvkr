@@ -502,7 +502,26 @@ func toInt64(val interface{}) int64 {
 	return int64(math.Round(f))
 }
 
+var monthNames = map[string]string{
+	"янв": "01", "фев": "02", "мар": "03", "апр": "04",
+	"май": "05", "мая": "05", "июн": "06", "июл": "07",
+	"авг": "08", "сен": "09", "окт": "10", "ноя": "11", "дек": "12",
+}
+
 func extractPeriodFromDatasetName(name string) string {
+	lowerName := strings.ToLower(name)
+	year := ""
+	month := ""
+
+	// 1. Ищем текстовое упоминание месяца в названии
+	for key, val := range monthNames {
+		if strings.Contains(lowerName, key) {
+			month = val
+			break
+		}
+	}
+
+	// 2. Ищем год и/или цифровой месяц (например: report_2023_09.xlsx)
 	parts := strings.FieldsFunc(name, func(r rune) bool {
 		return r < '0' || r > '9'
 	})
@@ -510,19 +529,34 @@ func extractPeriodFromDatasetName(name string) string {
 	for i := len(parts) - 1; i >= 0; i-- {
 		part := parts[i]
 
+		// Ищем 4 цифры (год)
 		if len(part) == 4 {
-			year, err := strconv.Atoi(part)
-			if err == nil && year >= 2000 && year <= 2100 {
-				return part
-			}
-		}
+			if y, err := strconv.Atoi(part); err == nil && y >= 2000 && y <= 2100 {
+				year = part
 
-		if len(part) == 2 {
-			year, err := strconv.Atoi(part)
-			if err == nil && year >= 16 && year <= 40 {
-				return fmt.Sprintf("20%02d", year)
+				// Если месяц текстом не нашли, смотрим на соседнее число (возможно, это номер месяца)
+				if month == "" && i > 0 && len(parts[i-1]) <= 2 {
+					m, _ := strconv.Atoi(parts[i-1])
+					if m >= 1 && m <= 12 {
+						month = fmt.Sprintf("%02d", m)
+					}
+				}
+				break
+			}
+		} else if len(part) == 2 && year == "" {
+			// Ищем 2 цифры как год, если 4 цифры не найдены
+			if y, err := strconv.Atoi(part); err == nil && y >= 16 && y <= 40 {
+				year = fmt.Sprintf("20%02d", y)
+				break
 			}
 		}
+	}
+
+	if year != "" {
+		if month == "" {
+			month = "01" // Fallback: если месяц не определен, ставим январь
+		}
+		return fmt.Sprintf("%s-%s", year, month)
 	}
 
 	return "unknown"
@@ -575,8 +609,8 @@ func (s *Service) detectColumnMapping(ctx context.Context, data []map[string]int
 Определи, какие колонки соответствуют следующим понятиям:
 - student_id: уникальный идентификатор студента (номер зачётки, ID, и т.д.)
 - full_name: ФИО или имя студента
-- enrollment_year: год поступления (или дата, из которой можно извлечь год)
-- graduation_year: год выпуска
+- enrollment_year: ДАТА зачисления/поступления (колонка с датой, из которой можно извлечь год и месяц)
+- graduation_year: год или дата выпуска
 - status: текущий статус студента (обучается, отчислен, выпущен, академ и т.д.)
 - score: средний балл или оценка
 - active_statuses: список значений поля status, которые означают "студент сейчас активно учится"
@@ -872,28 +906,64 @@ func extractPeriod(row map[string]interface{}, mapping *ColumnMapping) string {
 		return "unknown"
 	}
 
-	// yyyy....
-	if len(raw) >= 4 {
-		yearStr := raw[:4]
-		if _, err := strconv.Atoi(yearStr); err == nil {
-			return yearStr
+	// Разбиваем строку по типичным разделителям дат
+	parts := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == '.' || r == '/' || r == '-' || r == ' '
+	})
+
+	if len(parts) >= 2 {
+		year := ""
+		month := ""
+
+		// Проверяем первый элемент (формат YYYY-MM-DD)
+		if len(parts[0]) == 4 {
+			year = parts[0]
+			month = fmt.Sprintf("%02d", parseMonth(parts[1]))
+		} else if len(parts[len(parts)-1]) == 4 {
+			// Проверяем последний элемент (формат DD.MM.YYYY)
+			year = parts[len(parts)-1]
+			if len(parts) >= 3 {
+				month = fmt.Sprintf("%02d", parseMonth(parts[len(parts)-2]))
+			} else { // MM.YYYY
+				month = fmt.Sprintf("%02d", parseMonth(parts[0]))
+			}
+		} else if len(parts[len(parts)-1]) == 2 {
+			// Формат DD.MM.YY
+			y, _ := strconv.Atoi(parts[len(parts)-1])
+			if y >= 0 && y <= 99 {
+				// Упрощенная логика: < 50 это 2000-е
+				year = fmt.Sprintf("20%02d", y)
+				if len(parts) >= 3 {
+					month = fmt.Sprintf("%02d", parseMonth(parts[len(parts)-2]))
+				} else {
+					month = fmt.Sprintf("%02d", parseMonth(parts[0]))
+				}
+			}
+		}
+
+		if year != "" && month != "00" {
+			return fmt.Sprintf("%s-%s", year, month)
 		}
 	}
 
-	// dd.mm.yyyy / yyyy-mm-dd / ...
-	parts := strings.FieldsFunc(raw, func(r rune) bool {
-		return r == '.' || r == '/' || r == '-'
-	})
-
-	for i := len(parts) - 1; i >= 0; i-- {
-		if len(parts[i]) == 4 {
-			if _, err := strconv.Atoi(parts[i]); err == nil {
-				return parts[i]
-			}
+	// Fallback: если указан только год (4 цифры)
+	if len(raw) >= 4 {
+		yearStr := raw[:4]
+		if _, err := strconv.Atoi(yearStr); err == nil {
+			return yearStr + "-01" // Если месяца нет, по умолчанию берем январь
 		}
 	}
 
 	return "unknown"
+}
+
+// Вспомогательная функция для парсинга месяца
+func parseMonth(m string) int {
+	v, _ := strconv.Atoi(m)
+	if v >= 1 && v <= 12 {
+		return v
+	}
+	return 0
 }
 
 func isActiveStatus(status string, activeStatuses []string) bool {

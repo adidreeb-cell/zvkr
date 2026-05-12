@@ -8,35 +8,9 @@ on:
     branches: [main]
 
 jobs:
-  frontend:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: oven-sh/setup-bun@v2
-
-      - name: Cache node_modules
-        uses: actions/cache@v4
-        with:
-          path: frontend/node_modules
-          key: bun-${{ hashFiles('frontend/bun.lockb', 'frontend/package.json') }}
-
-      - name: Build frontend
-        working-directory: frontend
-        run: |
-          bun install --frozen-lockfile
-          bun run tsc --noEmit
-          bun run vite build
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: frontend-dist
-          path: frontend/dist/
-          retention-days: 1
-
   build:
-    needs: frontend
     runs-on: ubuntu-latest
+
     strategy:
       matrix:
         include:
@@ -50,16 +24,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: oven-sh/setup-bun@v2
+
       - uses: actions/setup-go@v5
         with:
           go-version: 'stable'
           cache: true
 
-      - name: Download frontend dist
-        uses: actions/download-artifact@v4
+      - name: Cache frontend node_modules
+        uses: actions/cache@v4
         with:
-          name: frontend-dist
-          path: internal/routes/dist   
+          path: frontend/node_modules
+          key: bun-${{ hashFiles('frontend/bun.lockb', 'frontend/package.json') }}
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          bun install --frozen-lockfile
+          bun run tsc --noEmit
+          bun run vite build
+
+      - name: Copy frontend dist
+        run: |
+          rm -rf internal/routes/dist
+          mkdir -p internal/routes/dist
+          cp -r frontend/dist/* internal/routes/dist/
 
       - name: Build backend
         env:
@@ -72,43 +61,8 @@ jobs:
             -o zvkr-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }} \
             cmd/gate/main.go
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: zvkr-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: zvkr-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
-
-  release:
-    needs: build
-    if: github.event_name == 'push'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-          pattern: zvkr-*          
-
-      - name: Set release tag
-        id: tag
-        run: |
-          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            echo "tag=${{ github.ref_name }}"   >> "$GITHUB_OUTPUT"
-            echo "name=${{ github.ref_name }}"  >> "$GITHUB_OUTPUT"
-            echo "prerelease=false"             >> "$GITHUB_OUTPUT"
-          else
-            SHORT=$(echo "${{ github.sha }}" | cut -c1-7)
-            echo "tag=dev-${SHORT}"                  >> "$GITHUB_OUTPUT"
-            echo "name=Dev Build (${SHORT})"         >> "$GITHUB_OUTPUT"
-            echo "prerelease=true"                   >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Create Release
+      - name: Upload release file
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.tag.outputs.tag }}
-          name: ${{ steps.tag.outputs.name }}
-          prerelease: ${{ steps.tag.outputs.prerelease }}
-          generate_release_notes: true
-          files: artifacts/**/*
+          files: zvkr-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}

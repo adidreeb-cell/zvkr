@@ -127,6 +127,9 @@ func SetupRoutes(
 	// --- Upload ---
 	protected.Post("/upload", middleware.RoleCheck("analyst", "admin"), datasetHandler.Upload)
 
+	// --- Remove ---
+	protected.Get("/datasets/:id/remove", middleware.RoleCheck("analyst", "admin"), datasetHandler.RemoveDataset)
+
 	// --- Analytics ---
 	protected.Get("/analytics/sync", middleware.RoleCheck("analyst", "admin"), analyticsHandler.ForceSync)
 	protected.Get("/analytics/metrics", analyticsHandler.GetBasicMetrics)
